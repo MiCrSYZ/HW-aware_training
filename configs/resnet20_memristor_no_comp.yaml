@@ -12,7 +12,7 @@ val_split: 0.1
 model_name: resnet20
 
 batch_size: 128
-epochs: 100
+epochs: 10
 num_workers: 4
 eval_interval: 1
 save_interval: 10
@@ -52,9 +52,11 @@ memristor:
   enable_update_model: true # 启用状态依赖写入模型
   write:
     t_min: 5e-9      # 最小脉冲宽度
-    t_scale: 50e-9   # 脉冲时间的放大因子
+    t_scale: 1e-6   # 脉冲时间的放大因子
     V_write: 1.2     # 写入电压
-    write_interval: 120  # 写入间隔（默认等于epochs，即训练完成后一次性写入）
+    write_interval: 10  # 写入间隔（默认等于epochs，即训练完成后一次性写入）
+    max_pulses: 200  # 最大脉冲数（多脉冲写入-验证循环的最大迭代次数）
+    tolerance: 0.02  # 容差（相对于电导范围的比例，例如0.02表示2%的容差）
   # 写入更新模型参数（仅在enable_update_model=true时生效）
   update_params:
     A_plus: 1e-5  # Potentiation幅度系数

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import os
 import logging
 import pandas as pd
@@ -170,6 +170,8 @@ def run_experiment(
         write_t_min = float(write_config.get('t_min', 5e-9))  # 最小脉冲宽度
         write_t_scale = float(write_config.get('t_scale', 50e-9))  # 脉冲时间的放大因子
         write_V_write = float(write_config.get('V_write', 1.2))  # 写入电压
+        write_max_pulses = int(write_config.get('max_pulses', 200))  # 最大脉冲数
+        write_tolerance = float(write_config.get('tolerance', 0.02))  # 容差（相对于电导范围的比例）
         # write_interval 默认等于 epochs（训练完成后一次性写入）
         # 会在后面读取 epochs 后设置默认值
         
@@ -229,6 +231,8 @@ def run_experiment(
         write_t_min = 5e-9
         write_t_scale = 50e-9
         write_V_write = 1.2
+        write_max_pulses = 200
+        write_tolerance = 0.02
     
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
@@ -357,14 +361,19 @@ def run_experiment(
             raise ValueError(f"Unknown experiment mode: {experiment_mode}")
         
         # 应用写入更新（根据 write_interval）
+        # 如果 write_interval = epochs，则在训练循环结束后执行（避免重复）
+        # 否则，在训练循环中按间隔执行
         if (experiment_mode != 'baseline' and 
             device_model and 
             device_model.enable_update_model and 
-            epoch % write_interval == 0):
+            write_interval < epochs and  # 只在非一次性写入时在训练循环中执行
+            (epoch + 1) % write_interval == 0):
             experiment_logger.info(f"Applying writeback at epoch {epoch}")
             _apply_writeback(
                 model, device_model, 
-                write_t_min, write_t_scale, write_V_write
+                write_t_min, write_t_scale, write_V_write,
+                max_pulses=write_max_pulses,
+                tolerance=write_tolerance
             )
             # 如果是 memristor_no_comp 模式，还需要同步到 memristor_model
             if experiment_mode == 'memristor_no_comp':
@@ -569,6 +578,23 @@ def run_experiment(
             # Store mapping_net state for checkpoint
             if not hasattr(run_experiment, '_post_train_mapping_net_state'):
                 run_experiment._post_train_mapping_net_state = mapping_net.state_dict()
+    
+    # 在训练循环结束后、最终测试前，如果 write_interval = epochs，执行最后一次 writeback
+    # 这确保最终测试使用的是经过写入更新后的权重
+    if (experiment_mode != 'baseline' and 
+        device_model and 
+        device_model.enable_update_model and 
+        write_interval == epochs):
+        experiment_logger.info("Applying final writeback before test evaluation")
+        _apply_writeback(
+            model, device_model, 
+            write_t_min, write_t_scale, write_V_write,
+            max_pulses=write_max_pulses,
+            tolerance=write_tolerance
+        )
+        # 如果是 memristor_no_comp 模式，还需要同步到 memristor_model
+        if experiment_mode == 'memristor_no_comp':
+            _sync_weights_to_memristor_model(base_model, memristor_model)
     
     # Final evaluation on test set
     if test_loader:
@@ -1046,24 +1072,106 @@ def _sync_weights_to_memristor_model(base_model: nn.Module, memristor_model: nn.
         )
 
 
+def _program_conductance(
+    G_current: torch.Tensor,
+    G_target: torch.Tensor,
+    device_model: MemristorDeviceModel,
+    write_V: float,
+    write_t_min: float,
+    write_t_scale: float,
+    max_iters: int = 200,
+    tol: float = 0.02,
+) -> Tuple[torch.Tensor, int]:
+    """
+    多脉冲写入 → 验证循环。
+    
+    逐步将每个电导值推向目标值，使用迭代脉冲序列。
+    
+    Args:
+        G_current: 当前电导值张量
+        G_target: 目标电导值张量
+        device_model: 忆阻器器件模型
+        write_V: 写入电压
+        write_t_min: 最小脉冲宽度
+        write_t_scale: 脉冲时间缩放因子
+        max_iters: 最大迭代次数
+        tol: 容差（相对于电导范围的比例）
+        
+    Returns:
+        G_final: 最终电导值张量
+        num_pulses: 实际使用的脉冲数（平均）
+    """
+    G_range = device_model.G_max - device_model.G_min
+    tolerance = tol * G_range  # 绝对容差
+    
+    G_work = G_current.clone()
+    
+    # 计算初始误差
+    error = G_target - G_work
+    abs_error = torch.abs(error)
+    
+    # 使用掩码来跟踪哪些元素已经收敛
+    converged_mask = abs_error < tolerance
+    
+    # 记录迭代次数（用于统计平均脉冲数）
+    num_iterations = 0
+    
+    for iter_step in range(max_iters):
+        # 如果所有元素都收敛，提前退出
+        if converged_mask.all():
+            break
+        
+        # 计算方向：sign(error)
+        direction = torch.sign(error)
+        
+        # 计算归一化误差（用于动态脉冲宽度）
+        # 归一化到 [0.1, 1.0] 范围，确保小误差时也有足够的脉冲宽度
+        error_norm = abs_error / (G_range + 1e-12)
+        error_norm = torch.clamp(error_norm, min=0.1, max=1.0)
+        
+        # 计算动态脉冲宽度：write_t_min + write_t_scale * error_norm
+        # 误差大时使用更大的脉冲宽度，误差小时使用较小的脉冲宽度
+        pulse_t = write_t_min + write_t_scale * error_norm
+        
+        # 脉冲电压：方向 * write_V
+        pulse_V = direction * write_V
+        
+        # 应用写入更新（向量化操作，对所有元素同时进行）
+        G_work = device_model.write_update(
+            G_work, pulse_V, pulse_t, direction, seed=None
+        )
+        
+        # 更新迭代计数
+        num_iterations += 1
+        
+        # 重新计算误差和收敛掩码
+        error = G_target - G_work
+        abs_error = torch.abs(error)
+        converged_mask = abs_error < tolerance
+    
+    return G_work, num_iterations
+
+
 def _apply_writeback(
     model: nn.Module,
     device_model: MemristorDeviceModel,
     write_t_min: float,
     write_t_scale: float,
     write_V_write: float,
+    max_pulses: int = 200,
+    tolerance: float = 0.02,
 ) -> None:
     """
     应用写入更新模型，将目标权重写入到忆阻器器件中。
     
+    使用多脉冲写入-验证循环来模拟真实的忆阻器编程过程。
+    
     对于每个有权重的模块：
     1. 获取目标权重 W_target（optimizer更新后的权重）
-    2. 将当前权重映射到电导值 Gp_current, Gn_current
-    3. 计算有效权重 W_eff_current = scale * (Gp_current - Gn_current)
-    4. 计算权重差 ΔW = W_target - W_eff_current
-    5. 根据 ΔW 的符号确定方向，计算脉冲参数
-    6. 应用 write_update 更新电导值
-    7. 将更新后的电导值转换回权重并更新模块权重
+    2. 将当前权重映射到电导值 Gp_current, Gn_current（从硬件状态）
+    3. 将目标权重映射到目标电导值 Gp_target, Gn_target
+    4. 使用多脉冲循环将 (Gp_current, Gn_current) → (Gp_target, Gn_target)
+    5. 将编程后的电导值转换回权重并更新模块权重
     
     Args:
         model: 模型（可能是 MemristorModel wrapper，需要访问 base_model）
@@ -1071,18 +1179,22 @@ def _apply_writeback(
         write_t_min: 最小脉冲宽度
         write_t_scale: 脉冲时间的放大因子
         write_V_write: 写入电压
+        max_pulses: 最大脉冲数（默认200）
+        tolerance: 容差（相对于电导范围的比例，默认0.02即2%）
     """
     if not device_model.enable_update_model:
         return
     
-    # 获取实际的模型（可能是 MemristorModel wrapper）
+    # 获取实际的模型
     target_model = model
     if hasattr(model, 'base_model'):
         target_model = model.base_model
     
     with torch.no_grad():
-        total_delta_W = 0.0
         total_modules = 0
+        total_pulses_p = 0.0
+        total_pulses_n = 0.0
+        
         for module in target_model.modules():
             # 只处理有权重的模块（Linear, Conv2d等）
             if not hasattr(module, 'weight') or module.weight is None:
@@ -1093,114 +1205,68 @@ def _apply_writeback(
             # 获取目标权重（optimizer更新后的权重，这是我们要写入的目标）
             W_target = module.weight.data.clone()
             
-            # 将目标权重映射到电导值
-            # 使用 map_weights_to_conductance_diff_adaptive 获取 Gp, Gn, max_abs
+            # 1. 将当前权重映射到当前电导值（从硬件状态）
+            # 这代表忆阻器上的实际电导值（上一轮写入后的状态）
+            Gp_current, Gn_current, max_abs_current = device_model.map_weights_to_conductance_diff_adaptive(
+                module.weight.data
+            )
+            
+            # 2. 将目标权重映射到目标电导值
             Gp_target, Gn_target, max_abs = device_model.map_weights_to_conductance_diff_adaptive(W_target)
             
-            # 计算 scale
+            # 计算 scale（用于后续转换回权重）
             G_range = (device_model.G_max - device_model.G_min)
             scale = max_abs / (G_range + 1e-12)
             scale = torch.clamp(scale, min=1e-3, max=1e6)
             
-            # 正确的逻辑：
-            # 1. W_target 是 optimizer 更新后的目标权重
-            # 2. 我们需要将这个权重"写入"到忆阻器中
-            # 3. 写入过程：从当前电导值更新到目标电导值
-            #
-            # 关键问题：我们不知道"当前忆阻器的电导值"是什么
-            # 
-            # 合理的假设：
-            # - 初始状态：Gp 和 Gn 都在中间值 (G_min + G_max) / 2，对应零权重
-            # - 目标状态：Gp_target 和 Gn_target，对应目标权重
-            # - 写入过程：从初始状态写入到目标状态
-            #
-            # 这样，delta_W 会有实际的值，write_update 会生效
-            # 如果 A_plus=A_minus，写入应该是理想的，结果应该接近目标权重
-            
-            # 假设当前电导值在中间值（对应零权重）
-            G_mid = (device_model.G_min + device_model.G_max) / 2.0
-            Gp_current = torch.full_like(Gp_target, G_mid)
-            Gn_current = torch.full_like(Gn_target, G_mid)
-            
-            # 计算当前有效权重（应该接近 0）
-            W_eff_current = (Gp_current - Gn_current) * scale
-            
-            # 计算权重差：这是我们需要写入的变化量
-            delta_W = W_target - W_eff_current
-            
-            # 计算脉冲参数
-            # direction_p: 正电导的方向（>0表示potentiation，<=0表示depression）
-            # direction_n: 负电导的方向（与direction_p相反）
-            direction_p = torch.sign(delta_W)  # >0表示需要增加，<=0表示需要减少
-            direction_n = -torch.sign(delta_W)  # 与direction_p相反
-            
-            # 计算脉冲宽度：使用 delta_W 的归一化值
-            delta_W_normalized = torch.abs(delta_W) / (max_abs + 1e-12)  # 归一化到[0, 1]
-            
-            # 脉冲电压：方向 * V_write
-            pulse_V_p = direction_p * write_V_write
-            pulse_V_n = direction_n * write_V_write
-            
-            # 脉冲宽度：t_min + t_scale * |W_target|（归一化）
-            # 使用目标权重的大小作为脉冲宽度的参考
-            pulse_t_p = write_t_min + write_t_scale * delta_W_normalized
-            pulse_t_n = write_t_min + write_t_scale * delta_W_normalized
-            
-            # 应用 write_update 更新电导值
-            Gp_new = device_model.write_update(
-                Gp_current, pulse_V_p, pulse_t_p, direction_p, seed=None
-            )
-            Gn_new = device_model.write_update(
-                Gn_current, pulse_V_n, pulse_t_n, direction_n, seed=None
+            # 3. 使用多脉冲循环编程电导值
+            Gp_prog, pulses_p = _program_conductance(
+                G_current=Gp_current,
+                G_target=Gp_target,
+                device_model=device_model,
+                write_V=write_V_write,
+                write_t_min=write_t_min,
+                write_t_scale=write_t_scale,
+                max_iters=max_pulses,
+                tol=tolerance,
             )
             
-            # 将更新后的电导值转换回权重
-            W_new = (Gp_new - Gn_new) * scale
+            Gn_prog, pulses_n = _program_conductance(
+                G_current=Gn_current,
+                G_target=Gn_target,
+                device_model=device_model,
+                write_V=write_V_write,
+                write_t_min=write_t_min,
+                write_t_scale=write_t_scale,
+                max_iters=max_pulses,
+                tol=tolerance,
+            )
             
-            # 计算实际变化量（用于调试）
-            delta_W_actual = (W_new - W_target).abs().mean().item()
-            total_delta_W += delta_W_actual
+            total_pulses_p += pulses_p
+            total_pulses_n += pulses_n
+            
+            # 4. 将编程后的电导值转换回权重
+            W_new = (Gp_prog - Gn_prog) * scale
+            
+            # 检查是否有 NaN 或 Inf
+            if torch.isnan(W_new).any() or torch.isinf(W_new).any():
+                logger.warning(f"W_new contains NaN/Inf in {type(module).__name__}, using target weights")
+                W_new = W_target.clone()
             
             # 更新模块权重
             module.weight.data.copy_(W_new)
         
-        # 记录调试信息
+        # 记录统计信息
         if total_modules > 0:
-            avg_delta = total_delta_W / total_modules
-            logger.info(f"Writeback applied to {total_modules} modules, avg weight change: {avg_delta:.6e}")
-            logger.info(f"Write params: A_plus={device_model.update_params['A_plus']}, "
-                       f"A_minus={device_model.update_params['A_minus']}")
+            avg_pulses_p = total_pulses_p / total_modules
+            avg_pulses_n = total_pulses_n / total_modules
+            avg_pulses = (avg_pulses_p + avg_pulses_n) / 2.0
             
-            # 计算脉冲参数
-            # direction_p: 正电导的方向（>0表示potentiation，<=0表示depression）
-            # direction_n: 负电导的方向（与direction_p相反）
-            direction_p = torch.sign(delta_W)  # >0表示需要增加，<=0表示需要减少
-            direction_n = -torch.sign(delta_W)  # 与direction_p相反
-            
-            # 脉冲电压：方向 * V_write
-            pulse_V_p = direction_p * write_V_write
-            pulse_V_n = direction_n * write_V_write
-            
-            # 脉冲宽度：t_min + t_scale * |ΔW|
-            # 使用 abs(delta_W) 的归一化值来计算脉冲宽度
-            # 需要将 delta_W 归一化到合理范围
-            delta_W_normalized = torch.abs(delta_W) / (max_abs + 1e-12)  # 归一化到[0, 1]
-            pulse_t_p = write_t_min + write_t_scale * delta_W_normalized
-            pulse_t_n = write_t_min + write_t_scale * delta_W_normalized
-            
-            # 应用 write_update 更新电导值
-            Gp_new = device_model.write_update(
-                Gp_current, pulse_V_p, pulse_t_p, direction_p, seed=None
+            logger.info(
+                f"Writeback applied to {total_modules} modules: "
+                f"avg pulses per layer: {avg_pulses:.1f} "
+                f"(Gp: {avg_pulses_p:.1f}, Gn: {avg_pulses_n:.1f})"
             )
-            Gn_new = device_model.write_update(
-                Gn_current, pulse_V_n, pulse_t_n, direction_n, seed=None
-            )
-            
-            # 将更新后的电导值转换回权重
-            W_new = (Gp_new - Gn_new) * scale
-            
-            # 更新模块权重
-            module.weight.data.copy_(W_new)
 
 
 def _train_hat(

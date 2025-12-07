@@ -12,7 +12,7 @@ val_split: 0.1
 model_name: resnet20
 
 batch_size: 128
-epochs: 120
+epochs: 100
 num_workers: 4
 eval_interval: 1
 save_interval: 10
@@ -33,7 +33,7 @@ memristor:
   variability_sigma: 0.1
   read_noise_sigma: 1e-7
   drift_alpha: 1e-4
-  stuck_ratio: 0.0
+  stuck_ratio: 0.1
   stuck_low_prob: 0.5
   ir_drop_beta: 0.0
   mapping: linear
@@ -49,12 +49,14 @@ memristor:
   adc_bits: 8  # ADC量化位数
   enable_adc: false  # 启用ADC量化
   enable_energy: false  # 启用能耗估计
-  enable_update_model: true # 启用状态依赖写入模型
+  enable_update_model: false # 启用状态依赖写入模型
   write:
     t_min: 5e-9      # 最小脉冲宽度
     t_scale: 50e-9   # 脉冲时间的放大因子
     V_write: 1.2     # 写入电压
-    write_interval: 120  # 写入间隔（默认等于epochs，即训练完成后一次性写入）
+    write_interval: 100  # 写入间隔（默认等于epochs，即训练完成后一次性写入）
+    max_pulses: 200  # 最大脉冲数（多脉冲写入-验证循环的最大迭代次数）
+    tolerance: 0.02  # 容差（相对于电导范围的比例，例如0.02表示2%的容差）
   # 写入更新模型参数（仅在enable_update_model=true时生效）
   update_params:
     A_plus: 5e-5  # Potentiation幅度系数

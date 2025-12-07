@@ -127,8 +127,16 @@ class MemristorDeviceModel:
         self.ir_drop_gamma = ir_drop_gamma
         self.ir_drop_scaling = ir_drop_scaling
         
+        # 存储 seed 用于生成固定的 stuck mask
+        self.seed = seed
         if seed is not None:
             torch.manual_seed(seed)
+        
+        # 初始化 stuck mask 为 None，将在第一次调用时根据输入形状生成
+        self._stuck_mask = None
+        self._stuck_mask_shape = None
+        self._stuck_low_mask = None
+        self._stuck_high_mask = None
     
     def map_weights_to_conductance(
         self, 
@@ -214,6 +222,51 @@ class MemristorDeviceModel:
         # Return conductances and max_abs for scale recovery in forward pass
         return G_pos, G_neg, max_abs
 
+    def _get_stuck_mask(self, shape: torch.Size, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        获取固定的 stuck mask（基于 seed）。
+        
+        如果 shape 改变，会重新生成；否则复用已生成的 mask。
+        
+        Args:
+            shape: 电导张量的形状
+            device: 设备
+            dtype: 数据类型
+            
+        Returns:
+            stuck_low_mask: 固定在 G_min 的 mask
+            stuck_high_mask: 固定在 G_max 的 mask
+        """
+        # 如果形状改变或 mask 未初始化，重新生成
+        if (self._stuck_mask_shape != shape or 
+            self._stuck_mask is None or
+            self._stuck_low_mask is None or
+            self._stuck_high_mask is None):
+            
+            # 使用固定的 seed 生成 stuck mask
+            if self.seed is not None:
+                generator = torch.Generator(device=device)
+                generator.manual_seed(self.seed)
+                stuck_rand = torch.rand(shape, generator=generator, device=device, dtype=dtype, requires_grad=False)
+                mask_rand = torch.rand(shape, generator=generator, device=device, dtype=dtype, requires_grad=False)
+            else:
+                # 如果没有 seed，使用随机（但每次调用都会重新生成）
+                stuck_rand = torch.rand(shape, device=device, dtype=dtype, requires_grad=False)
+                mask_rand = torch.rand(shape, device=device, dtype=dtype, requires_grad=False)
+            
+            # 生成 stuck mask
+            mask = mask_rand < self.stuck_ratio
+            stuck_low = (stuck_rand < self.stuck_low_prob) & mask
+            stuck_high = mask & (~stuck_low)
+            
+            # 缓存结果
+            self._stuck_mask = mask
+            self._stuck_mask_shape = shape
+            self._stuck_low_mask = stuck_low
+            self._stuck_high_mask = stuck_high
+        
+        return self._stuck_low_mask, self._stuck_high_mask
+    
     def apply_nonidealities(
         self,
         G: torch.Tensor,
@@ -225,17 +278,17 @@ class MemristorDeviceModel:
         Apply non-idealities to conductance values.
         
         This is the key function where device non-idealities are injected.
-        Applied effects:
-        1. Variability: Multiplicative Gaussian noise
-        2. Read noise: Additive Gaussian noise
-        3. Drift: Time-dependent degradation
-        4. Stuck-at faults: Devices stuck at G_min or G_max
-        5. IR-drop: Column-dependent voltage drop
+        Applied effects (in order):
+        1. Stuck-at faults: Devices stuck at G_min or G_max (fixed based on seed)
+        2. Variability: Multiplicative Gaussian noise (only on non-stuck cells)
+        3. Read noise: Additive Gaussian noise (only on non-stuck cells)
+        4. Drift: Time-dependent degradation (only on non-stuck cells)
+        5. IR-drop: Column-dependent voltage drop (only on non-stuck cells)
         
         Args:
             G: Conductance tensor
             t: Time/cycle index for drift calculation
-            seed: Random seed for this operation (None for random)
+            seed: Random seed for this operation (None for random, only affects non-stuck cells)
             col_load: Optional column load tensor for IR-drop calculation
             
         Returns:
@@ -250,27 +303,43 @@ class MemristorDeviceModel:
         else:
             generator = None
 
+        # 1. 首先应用固定值故障：单元固定在高/低阻值（基于固定的 seed）
+        # 这会在后续步骤中保护这些 cell 不被其他故障影响
+        stuck_low_mask = None
+        stuck_high_mask = None
+        if self.stuck_ratio > 0:
+            stuck_low_mask, stuck_high_mask = self._get_stuck_mask(G.size(), device, dtype)
+            # 应用 stuck 故障
+            G = torch.where(stuck_low_mask, torch.full_like(G, self.G_min), G)
+            G = torch.where(stuck_high_mask, torch.full_like(G, self.G_max), G)
+        
+        # 创建非 stuck 的 mask（用于后续步骤）
+        if self.stuck_ratio > 0:
+            non_stuck_mask = ~(stuck_low_mask | stuck_high_mask)
+        else:
+            non_stuck_mask = torch.ones_like(G, dtype=torch.bool)
+
+        # 2. 各器件间差异(multiplicative) - 只应用于非 stuck 的 cell
         # G'=G*(1+epsilon_v)+eta
         # epsilon_v~N(0, sigma_v), eta~N(0, sigma_read)
-        # 1. 各器件间差异(multiplicative)
         if self.variability_sigma > 0:
             if generator is not None:
                 eps = torch.randn(G.size(), generator=generator, device=device, dtype=dtype, requires_grad=False) * self.variability_sigma
             else:
                 eps = torch.randn_like(G) * self.variability_sigma
-            # Random noise should not have gradients, but multiplication with G maintains gradient flow
-            G = G * (1.0 + eps)
+            # 只对非 stuck 的 cell 应用 variability
+            G = torch.where(non_stuck_mask, G * (1.0 + eps), G)
         
-        # 2. 读噪声(additive)
+        # 3. 读噪声(additive) - 只应用于非 stuck 的 cell
         if self.read_noise_sigma > 0:
             if generator is not None:
                 noise = torch.randn(G.size(), generator=generator, device=device, dtype=dtype, requires_grad=False) * self.read_noise_sigma
             else:
                 noise = torch.randn_like(G) * self.read_noise_sigma
-            # Random noise should not have gradients, but addition with G maintains gradient flow
-            G = G + noise
+            # 只对非 stuck 的 cell 应用 read noise
+            G = torch.where(non_stuck_mask, G + noise, G)
         
-        # 3. 随时间变化的电导漂移
+        # 4. 随时间变化的电导漂移 - 只应用于非 stuck 的 cell
         # G_t=G'*(1-alpha*log(1+t))
         # 根据配置选择时间t的设置方式
         if self.drift_alpha > 0:
@@ -287,25 +356,10 @@ class MemristorDeviceModel:
             if drift_t > 0:
                 drift_factor = 1.0 - self.drift_alpha * np.log(1 + drift_t)
                 drift_factor = max(drift_factor, 0.0)
-                G = G * drift_factor
+                # 只对非 stuck 的 cell 应用 drift
+                G = torch.where(non_stuck_mask, G * drift_factor, G)
         
-        # 4. 固定值故障：单元固定在高/低阻值
-        if self.stuck_ratio > 0:
-            if generator is not None:
-                mask = torch.rand(G.size(), generator=generator, device=device, dtype=dtype, requires_grad=False) < self.stuck_ratio
-                stuck_rand = torch.rand(G.size(), generator=generator, device=device, dtype=dtype, requires_grad=False)
-            else:
-                mask = torch.rand_like(G) < self.stuck_ratio
-                stuck_rand = torch.rand_like(G)
-            
-            if mask.any():
-                stuck_low = (stuck_rand < self.stuck_low_prob) & mask
-                stuck_high = mask & (~stuck_low)
-                # torch.where maintains gradient flow: gradient only flows through non-stuck elements
-                G = torch.where(stuck_low, torch.full_like(G, self.G_min), G)
-                G = torch.where(stuck_high, torch.full_like(G, self.G_max), G)
-        
-        # 5. IR-drop: 交叉阵列中因导线电阻导致的电压降
+        # 5. IR-drop: 交叉阵列中因导线电阻导致的电压降 - 只应用于非 stuck 的 cell
         if self.ir_drop_beta > 0:
             if col_load is not None:
                 # Normalize col_load to [0, 1]
@@ -324,10 +378,12 @@ class MemristorDeviceModel:
                 # Broadcast scale to match G shape
                 for _ in range(G.dim() - scale.dim()):
                     scale = scale.unsqueeze(-1)
-                G = G * scale
+                # 只对非 stuck 的 cell 应用 IR-drop
+                G = torch.where(non_stuck_mask, G * scale, G)
             else:
                 # Simplified: uniform scaling
-                G = G * (1.0 - self.ir_drop_beta)
+                # 只对非 stuck 的 cell 应用 IR-drop
+                G = torch.where(non_stuck_mask, G * (1.0 - self.ir_drop_beta), G)
         
         # Ensure conductance stays in valid range
         G = torch.clamp(G, self.G_min, self.G_max)
@@ -463,9 +519,7 @@ class MemristorDeviceModel:
         
         # 抑制: ΔG_dep = −A⁻ *((G/G_min − 1))^(p⁻)*f(V,t)
         dep_mask = direction <= 0
-        G_norm_dep = (G / (self.G_min + 1e-12)) - 1.0
-        G_norm_dep = torch.clamp(G_norm_dep, min=0.0, max=1.0)  # 确保在[0,1]范围内
-        # 使用 torch.pow 而不是 ** 运算符，确保类型兼容
+        G_norm_dep = (G / (self.G_max + 1e-12)).clamp(0.0, 1.0)
         delta_G_dep = -A_minus * torch.pow(G_norm_dep, p_minus) * exp_term
         
         # 组合更新
