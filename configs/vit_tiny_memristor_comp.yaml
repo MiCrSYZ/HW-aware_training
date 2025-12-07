@@ -1,0 +1,79 @@
+# ViT-Tiny with memristor and compensation (HAT)
+
+experiment_name: vit_tiny_memristor_comp
+seed: 42
+device: cuda
+
+dataset: cifar10
+data_root: ./datasets/cifar-10
+num_classes: 10
+val_split: 0.1
+
+model_name: vit_tiny
+
+batch_size: 128
+epochs: 100
+num_workers: 4
+eval_interval: 1
+save_interval: 10
+
+# ViT typically uses Adam optimizer with lower learning rate
+optimizer:
+  type: adam
+  lr: 0.001
+  weight_decay: 0.01
+
+scheduler:
+  type: cosine
+
+memristor:
+  G_min: 1e-6
+  G_max: 1e-4
+  weight_clip: [-1.0, 1.0]
+  variability_sigma: 0.05
+  read_noise_sigma: 1e-7
+  drift_alpha: 1e-4
+  stuck_ratio: 0.0
+  stuck_low_prob: 0.5
+  ir_drop_beta: 0.0
+  mapping: linear
+  # 新的IR-drop模型参数（基于论文方程16-18）
+  ir_drop_mode: none  # options: none | simple | paper
+  ir_drop_gamma: 0.35  # 导线电阻缩放因子
+  ir_drop_scaling: 1.0  # IR-drop校正项的最终缩放因子
+  # 电导漂移时间设置方式
+  drift_time_mode: accumulate  # 'fixed' 或 'accumulate'：固定值或模拟真实器件老化（t随推理次数累加）
+  drift_time_fixed: 0  # 固定值模式下的t值（仅在drift_time_mode='fixed'时生效）
+  # 新增参数：阵列规模和功能开关
+  array_size: 128  # 忆阻器阵列规模（tile大小）
+  adc_bits: 6  # ADC量化位数
+  enable_update_model: false  # 启用状态依赖写入模型
+  enable_adc: false  # 启用ADC量化
+  enable_energy: false  # 启用能耗估计
+  # 写入更新模型参数（仅在enable_update_model=true时生效）
+  update_params:
+    A_plus: 1e-5  # Potentiation幅度系数
+    A_minus: 1e-5  # Depression幅度系数
+    p_plus: 1.0  # Potentiation非线性指数
+    p_minus: 1.0  # Depression非线性指数
+    gamma: 1.0  # 电压-时间耦合系数
+    write_noise_ratio: 0.05  # 写入噪声比例（相对于ΔG）
+  # 能耗系数（仅在enable_energy=true时生效）
+  energy_coefs:
+    alpha: 1.0  # 写入能耗系数 (E_write = alpha * V^2 * t)
+    beta: 1.0  # 读出能耗系数 (E_read = beta * 2^bits)
+
+experiment:
+  mode: memristor_with_comp
+  compensation_method: hat
+  energy_estimation: false
+  energy_params:
+    subarray_size: 128
+    num_subarrays: 1
+    technology_node_nm: 45
+
+logging:
+  use_wandb: false
+  project_name: memristor-nn
+  run_name: vit_tiny_memristor_comp
+
