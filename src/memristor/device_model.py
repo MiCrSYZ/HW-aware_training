@@ -272,7 +272,6 @@ class MemristorDeviceModel:
         G: torch.Tensor,
         t: int = 0,
         seed: Optional[int] = None,
-        col_load: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Apply non-idealities to conductance values.
@@ -283,13 +282,12 @@ class MemristorDeviceModel:
         2. Variability: Multiplicative Gaussian noise (only on non-stuck cells)
         3. Read noise: Additive Gaussian noise (only on non-stuck cells)
         4. Drift: Time-dependent degradation (only on non-stuck cells)
-        5. IR-drop: Column-dependent voltage drop (only on non-stuck cells)
+        5. IR-drop: Uniform voltage drop (only on non-stuck cells)
         
         Args:
             G: Conductance tensor
             t: Time/cycle index for drift calculation
             seed: Random seed for this operation (None for random, only affects non-stuck cells)
-            col_load: Optional column load tensor for IR-drop calculation
             
         Returns:
             G_noisy: Conductance tensor with non-idealities applied
@@ -361,29 +359,8 @@ class MemristorDeviceModel:
         
         # 5. IR-drop: 交叉阵列中因导线电阻导致的电压降 - 只应用于非 stuck 的 cell
         if self.ir_drop_beta > 0:
-            if col_load is not None:
-                # Normalize col_load to [0, 1]
-                col = torch.tensor(col_load, device=device, dtype=dtype)
-                col_min = col.min()
-                col_max = col.max()
-                if col_max > col_min:
-                    col_norm = (col - col_min) / (col_max - col_min + 1e-12)
-                else:
-                    col_norm = torch.zeros_like(col)
-                
-                # Expand to match G dimensions
-                scale = 1.0 - self.ir_drop_beta * col_norm
-                while scale.dim() < G.dim():
-                    scale = scale.unsqueeze(0)
-                # Broadcast scale to match G shape
-                for _ in range(G.dim() - scale.dim()):
-                    scale = scale.unsqueeze(-1)
-                # 只对非 stuck 的 cell 应用 IR-drop
-                G = torch.where(non_stuck_mask, G * scale, G)
-            else:
-                # Simplified: uniform scaling
-                # 只对非 stuck 的 cell 应用 IR-drop
-                G = torch.where(non_stuck_mask, G * (1.0 - self.ir_drop_beta), G)
+            # Uniform scaling: 只对非 stuck 的 cell 应用 IR-drop
+            G = torch.where(non_stuck_mask, G * (1.0 - self.ir_drop_beta), G)
         
         # Ensure conductance stays in valid range
         G = torch.clamp(G, self.G_min, self.G_max)

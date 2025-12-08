@@ -15,7 +15,6 @@ def hardware_linear_forward(
     device_model: MemristorDeviceModel,
     t: int = 0,
     seed: Optional[int] = None,
-    col_load: Optional[torch.Tensor] = None,
     learned_scale: Optional[float] = None,
     learned_offset: Optional[float] = None,
 ) -> tuple:
@@ -30,7 +29,7 @@ def hardware_linear_forward(
     
     # Use adaptive mapping for backward compatibility
     # This ensures the function works even though it's deprecated
-    output, _ = hardware_linear_forward_adaptive(x, W, device_model, t=t, seed=seed, col_load=col_load)
+    output, _ = hardware_linear_forward_adaptive(x, W, device_model, t=t, seed=seed)
     return output, (None, None)  # Return empty debug info for compatibility
 
 def hardware_linear_forward_adaptive(
@@ -39,15 +38,14 @@ def hardware_linear_forward_adaptive(
     device_model: MemristorDeviceModel,
     t: int = 0,
     seed: Optional[int] = None,
-    col_load: Optional[torch.Tensor] = None,
 ) -> tuple:
 
     # Map weights to differential conductances adaptively
     Gp, Gn, max_abs = device_model.map_weights_to_conductance_diff_adaptive(W)
 
     # Apply non-idealities separately (seed can be different or same depending on model)
-    Gp_noisy = device_model.apply_nonidealities(Gp, t=t, seed=seed, col_load=col_load)
-    Gn_noisy = device_model.apply_nonidealities(Gn, t=t, seed=(None if seed is None else seed+1), col_load=col_load)
+    Gp_noisy = device_model.apply_nonidealities(Gp, t=t, seed=seed)
+    Gn_noisy = device_model.apply_nonidealities(Gn, t=t, seed=(None if seed is None else seed+1))
 
     # Effective conductance difference (this is in conductance units, ~1e-6 to 1e-4)
     W_eff_conductance = Gp_noisy - Gn_noisy

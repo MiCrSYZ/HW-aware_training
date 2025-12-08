@@ -88,7 +88,6 @@ def hardware_linear_forward_with_weight_mapping(
     mapping_net: Optional[nn.Module] = None,
     t: int = 0,
     seed: Optional[int] = None,
-    col_load: Optional[torch.Tensor] = None,
     enable_sanity_check: bool = True,
     max_frac: float = 0.5,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
@@ -102,8 +101,8 @@ def hardware_linear_forward_with_weight_mapping(
     else:
         # map -> apply_nonidealities once -> map back
         Gp, Gn, max_abs = device_model.map_weights_to_conductance_diff_adaptive(W)
-        Gp_noisy = device_model.apply_nonidealities(Gp, t=t, seed=seed, col_load=col_load)
-        Gn_noisy = device_model.apply_nonidealities(Gn, t=t, seed=(None if seed is None else seed+1), col_load=col_load)
+        Gp_noisy = device_model.apply_nonidealities(Gp, t=t, seed=seed)
+        Gn_noisy = device_model.apply_nonidealities(Gn, t=t, seed=(None if seed is None else seed+1))
         G_range = (device_model.G_max - device_model.G_min)
         scale_back = max_abs / (G_range + eps)
         scale_back = torch.clamp(scale_back, min=1e-9, max=1e9)
