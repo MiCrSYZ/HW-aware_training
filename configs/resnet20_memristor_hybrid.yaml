@@ -87,6 +87,11 @@ experiment:
     enabled: false
     beta: 0.5  # Weight for hw_mse loss (MSE between float and hardware outputs)
     gamma: 1e-5  # Weight for regularization ||Δ||_2^2
+  # Boundary regularization parameters
+  boundary_regularization:
+    enabled: false  # Set to true to enable boundary regularization
+    lambda: 1e-4  # Regularization weight (λ)
+    beta: 0.8  # Boundary threshold ratio (β), threshold = β * w_max
   energy_estimation: false
   energy_params:
     subarray_size: 128

@@ -382,13 +382,20 @@ class MemristorDeviceModel:
         3) Δỹ_i = -c_i * sum_j ŵ_ij * x̃_j * ( j^2 / n^2 )
         
         Args:
-            y_tilde: 归一化输出 [batch, out_features]
+            y_tilde: 归一化输出 [batch, ..., out_features] 或 [batch, out_features]
             W_tilde: 归一化权重 [out_features, in_features]
-            x_tilde: 归一化输入 [batch, in_features]
+            x_tilde: 归一化输入 [batch, ..., in_features] 或 [batch, in_features]
             
         Returns:
-            y_tilde_with_ir: 应用IR-drop校正后的输出 [batch, out_features]
+            y_tilde_with_ir: 应用IR-drop校正后的输出，形状与 y_tilde 相同
         """
+        # 处理多维输入（例如卷积层或序列输入）
+        orig_shape = y_tilde.shape
+        if y_tilde.dim() > 2:
+            # 将除最后一个维度外的所有维度展平为 batch 维度
+            y_tilde = y_tilde.reshape(-1, y_tilde.shape[-1])  # [batch*..., out_features]
+            x_tilde = x_tilde.reshape(-1, x_tilde.shape[-1])  # [batch*..., in_features]
+        
         batch_size, out_features = y_tilde.shape
         in_features = x_tilde.shape[1]
         n = in_features  # 输入列数
@@ -414,10 +421,16 @@ class MemristorDeviceModel:
         # 计算活动项 a_i = γ * n * sum_j |ŵ_ij| * |x̃_j|
         a_i = self.ir_drop_gamma * n * activity_sum  # [batch, out_features]
         
+        # 数值稳定性保护：裁剪 a_i 以防止 a_i^3 溢出
+        # 对于 float32，最大值约为 3.4e38，a_i^3 在 a_i > 1500 时会溢出
+        # 我们裁剪到合理范围，例如 [0, 100]，这应该足够覆盖大多数情况
+        a_i_clamped = torch.clamp(a_i, min=0.0, max=100.0)
+        
         # 计算非线性多项式系数 c_i = 0.05*a_i^3 – 0.2*a_i^2 + 0.5*a_i
-        c_i = (0.05 * (a_i ** 3) - 
-               0.2 * (a_i ** 2) + 
-               0.5 * a_i)  # [batch, out_features]
+        # 使用裁剪后的 a_i 以防止数值溢出
+        c_i = (0.05 * (a_i_clamped ** 3) - 
+               0.2 * (a_i_clamped ** 2) + 
+               0.5 * a_i_clamped)  # [batch, out_features]
         
         # 计算 sum_j ŵ_ij * x̃_j * ( j^2 / n^2 )
         # 优化：使用矩阵乘法而不是扩展维度
@@ -436,6 +449,10 @@ class MemristorDeviceModel:
         
         # 返回校正后的输出 ỹ + Δỹ
         y_tilde_with_ir = y_tilde + delta_y_tilde
+        
+        # 如果原始输入是多维的，恢复原始形状
+        if len(orig_shape) > 2:
+            y_tilde_with_ir = y_tilde_with_ir.reshape(orig_shape)
         
         return y_tilde_with_ir
     

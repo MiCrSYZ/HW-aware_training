@@ -49,7 +49,7 @@ memristor:
   adc_bits: 8  # ADC量化位数
   enable_adc: false  # 启用ADC量化
   enable_energy: false  # 启用能耗估计
-  enable_update_model: false # 启用状态依赖写入模型
+  enable_update_model: true # 启用状态依赖写入模型
   write:
     t_min: 5e-9      # 最小脉冲宽度
     t_scale: 50e-9   # 脉冲时间的放大因子
@@ -59,7 +59,7 @@ memristor:
     tolerance: 0.02  # 容差（相对于电导范围的比例，例如0.02表示2%的容差）
   # 写入更新模型参数（仅在enable_update_model=true时生效）
   update_params:
-    A_plus: 5e-5  # Potentiation幅度系数
+    A_plus: 4e-5  # Potentiation幅度系数
     A_minus: 3e-5  # Depression幅度系数
     p_plus: 1.0  # Potentiation非线性指数
     p_minus: 1.0  # Depression非线性指数
@@ -73,6 +73,11 @@ memristor:
 experiment:
   mode: memristor_with_comp
   compensation_method: hat
+  # Boundary regularization parameters
+  boundary_regularization:
+    enabled: false  # Set to true to enable boundary regularization
+    lambda: 1e-4  # Regularization weight (λ)
+    beta: 0.8  # Boundary threshold ratio (β), threshold = β * w_max
   energy_estimation: false
   energy_params:
     subarray_size: 128

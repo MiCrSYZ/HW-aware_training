@@ -201,6 +201,7 @@ def hybrid_compensation_train(
     mapping_lr: float = 1e-4,
     mapping_alpha: float = 0.5,
     mapping_lambda_reg: float = 1e-4,
+    boundary_reg_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
     """
     Hybrid compensation strategy with two-stage training.
@@ -281,7 +282,45 @@ def hybrid_compensation_train(
             except TypeError:
                 output = model(data)
             
-            loss = criterion(output, target)
+            loss_task = criterion(output, target)
+            
+            # Boundary regularization (if enabled)
+            loss = loss_task
+            if boundary_reg_config is not None and boundary_reg_config.get('enabled', False):
+                # Compute boundary regularization
+                lambda_boundary = float(boundary_reg_config.get('lambda', 1e-4))
+                beta = float(boundary_reg_config.get('beta', 0.8))
+                wmax = device_model.wmax
+                threshold = beta * wmax
+                
+                # Get target model
+                target_model = model
+                if hasattr(model, 'base_model'):
+                    target_model = model.base_model
+                
+                total_reg = None
+                total_params = 0
+                for module in target_model.modules():
+                    if hasattr(module, 'weight') and module.weight is not None:
+                        module_name = type(module).__name__
+                        if 'Memristor' in module_name or hasattr(module, 'device_model'):
+                            W = module.weight
+                            N = W.numel()
+                            abs_W = torch.abs(W)
+                            excess = torch.clamp(abs_W - threshold, min=0.0)
+                            layer_reg = (excess ** 2).sum() / N
+                            if total_reg is None:
+                                total_reg = layer_reg
+                            else:
+                                total_reg = total_reg + layer_reg
+                            total_params += 1
+                
+                if total_params > 0:
+                    boundary_reg = total_reg
+                    loss = loss_task + lambda_boundary * boundary_reg
+                else:
+                    # No memristor layers found, skip boundary regularization
+                    boundary_reg = torch.tensor(0.0, device=device, requires_grad=True)
             
             # Check for NaN/Inf
             if torch.isnan(loss) or torch.isinf(loss):
@@ -419,6 +458,7 @@ def joint_hat_mapping_train(
     beta: float = 0.5,
     gamma: float = 1e-5,
     t_step: int = 0,
+    boundary_reg_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
     """
     Joint HAT + mapping_net training strategy.
@@ -532,8 +572,45 @@ def joint_hat_mapping_train(
         # Regularization loss: ||Δ||^2
         reg_loss = sum(p.pow(2).sum() for p in mapping_net.parameters())
         
+        # Boundary regularization (if enabled)
+        boundary_reg = torch.tensor(0.0, device=hw_output.device)
+        if boundary_reg_config is not None and boundary_reg_config.get('enabled', False):
+            lambda_boundary = float(boundary_reg_config.get('lambda', 1e-4))
+            beta_boundary = float(boundary_reg_config.get('beta', 0.8))
+            wmax = device_model.wmax
+            threshold = beta_boundary * wmax
+            
+            target_model = model
+            if hasattr(model, 'base_model'):
+                target_model = model.base_model
+            
+            total_reg = None
+            total_params = 0
+            for module in target_model.modules():
+                if hasattr(module, 'weight') and module.weight is not None:
+                    module_name = type(module).__name__
+                    if 'Memristor' in module_name or hasattr(module, 'device_model'):
+                        W = module.weight
+                        N = W.numel()
+                        abs_W = torch.abs(W)
+                        excess = torch.clamp(abs_W - threshold, min=0.0)
+                        layer_reg = (excess ** 2).sum() / N
+                        if total_reg is None:
+                            total_reg = layer_reg
+                        else:
+                            total_reg = total_reg + layer_reg
+                        total_params += 1
+            
+            if total_params > 0:
+                boundary_reg = total_reg
+            else:
+                boundary_reg = torch.tensor(0.0, device=hw_output.device, requires_grad=True)
+        
         # Total loss
         loss = task_loss + beta * hw_mse + gamma * reg_loss
+        if boundary_reg_config is not None and boundary_reg_config.get('enabled', False):
+            lambda_boundary = float(boundary_reg_config.get('lambda', 1e-4))
+            loss = loss + lambda_boundary * boundary_reg
 
         loss.backward()
 

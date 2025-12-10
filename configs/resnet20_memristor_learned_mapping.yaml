@@ -33,7 +33,7 @@ memristor:
   variability_sigma: 0.1
   read_noise_sigma: 1e-7
   drift_alpha: 1e-4
-  stuck_ratio: 0.0
+  stuck_ratio: 0.1
   stuck_low_prob: 0.5
   ir_drop_beta: 0.0
   mapping: linear
@@ -54,12 +54,12 @@ memristor:
     t_min: 5e-9      # 最小脉冲宽度
     t_scale: 50e-9   # 脉冲时间的放大因子
     V_write: 1.2     # 写入电压
-    write_interval: 120  # 写入间隔（默认等于epochs，即训练完成后一次性写入）
+    #write_interval: 120  # 这个参数在此模式下没用
     max_pulses: 200  # 最大脉冲数（多脉冲写入-验证循环的最大迭代次数）
     tolerance: 0.02  # 容差（相对于电导范围的比例，例如0.02表示2%的容差）
   # 写入更新模型参数（仅在enable_update_model=true时生效）
   update_params:
-    A_plus: 5e-5  # Potentiation幅度系数
+    A_plus: 4e-5  # Potentiation幅度系数
     A_minus: 3e-5  # Depression幅度系数
     p_plus: 1.0  # Potentiation非线性指数
     p_minus: 1.0  # Depression非线性指数
@@ -89,6 +89,11 @@ experiment:
     enabled: false  # Set to true to use joint training strategy
     beta: 0.5  # Weight for hw_mse loss (MSE between float and hardware outputs)
     gamma: 1e-5  # Weight for regularization ||Δ||_2^2
+  # Boundary regularization parameters
+  boundary_regularization:
+    enabled: false  # Set to true to enable boundary regularization
+    lambda: 1e-4  # Regularization weight (λ)
+    beta: 0.8  # Boundary threshold ratio (β), threshold = β * w_max
   energy_estimation: false
   energy_params:
     subarray_size: 128

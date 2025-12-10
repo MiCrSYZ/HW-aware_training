@@ -29,7 +29,8 @@ def hardware_linear_forward(
     
     # Use adaptive mapping for backward compatibility
     # This ensures the function works even though it's deprecated
-    output, _ = hardware_linear_forward_adaptive(x, W, device_model, t=t, seed=seed)
+    # Default to training=True for backward compatibility
+    output, _ = hardware_linear_forward_adaptive(x, W, device_model, t=t, seed=seed, training=True)
     return output, (None, None)  # Return empty debug info for compatibility
 
 def hardware_linear_forward_adaptive(
@@ -38,6 +39,7 @@ def hardware_linear_forward_adaptive(
     device_model: MemristorDeviceModel,
     t: int = 0,
     seed: Optional[int] = None,
+    training: bool = True,
 ) -> tuple:
 
     # Map weights to differential conductances adaptively
@@ -74,25 +76,28 @@ def hardware_linear_forward_adaptive(
         out = device_model.adc_quant(out, bits=device_model.adc_bits)
     
     # Apply new IR-drop correction based on paper equations (16)-(18) if enabled
-    if device_model.ir_drop_mode == "paper":
+    # For 'paper' mode, only apply IR-drop during inference (not during training)
+    if device_model.ir_drop_mode == "paper" and not training:
         # Normalize weights and inputs for IR-drop calculation
-        # W_tilde_normalized = W_eff / g_max
-        # x_tilde_normalized should match the normalization scale
-        # y_tilde = raw_output / (g_max * V_read)
-        # For simplicity, we assume V_read = 1.0 (normalized unit)
-        g_max = device_model.G_max
-        V_read = 1.0  # Normalized read voltage (assumed unit)
+        # Use a more stable normalization approach:
+        # 1. Normalize weights by their max absolute value to keep them in reasonable range
+        # 2. Normalize inputs similarly
+        # 3. This prevents numerical overflow in a_i^3 calculation
         
-        # Normalize weights: W_tilde = W_eff / g_max
-        W_tilde_normalized = W_eff / (g_max + 1e-12)  # [out_features, in_features]
+        # Compute normalization factors
+        W_abs_max = torch.abs(W_eff).max().clamp(min=1e-8)  # Avoid division by zero
+        x_abs_max = torch.abs(x).max().clamp(min=1e-8)
         
-        # Normalize inputs: x_tilde should be normalized to match weight normalization
-        # Since weights are normalized by g_max, we normalize inputs by the same factor
-        # to maintain consistent physical scale
-        x_tilde_normalized = x / (g_max * V_read + 1e-12)  # [batch, in_features]
+        # Normalize weights: W_tilde = W_eff / W_abs_max (keeps values in [-1, 1] range)
+        W_tilde_normalized = W_eff / W_abs_max  # [out_features, in_features]
         
-        # Normalize output: y_tilde = out / (g_max * V_read)
-        y_tilde = out / (g_max * V_read + 1e-12)  # [batch, out_features]
+        # Normalize inputs: x_tilde = x / x_abs_max (keeps values in reasonable range)
+        x_tilde_normalized = x / x_abs_max  # [batch, in_features]
+        
+        # Normalize output: y_tilde = out / (W_abs_max * x_abs_max) to maintain scale consistency
+        # This ensures y_tilde has similar magnitude to the normalized computation
+        output_scale = W_abs_max * x_abs_max
+        y_tilde = out / (output_scale + 1e-12)  # [batch, out_features]
         
         # Apply IR-drop correction
         y_tilde_with_ir = device_model.apply_ir_drop_paper(
@@ -102,7 +107,7 @@ def hardware_linear_forward_adaptive(
         )
         
         # Convert back to physical scale
-        out = y_tilde_with_ir * (g_max * V_read)
+        out = y_tilde_with_ir * output_scale
 
     return out, (Gp_noisy, Gn_noisy, W_eff_conductance, scale)
 
@@ -148,7 +153,7 @@ class MemristorLinear(nn.Module):
         Returns:
             Output tensor [batch, out_features]
         """
-        out, _ = hardware_linear_forward_adaptive(x, self.weight, self.device_model, t=t, seed=seed)
+        out, _ = hardware_linear_forward_adaptive(x, self.weight, self.device_model, t=t, seed=seed, training=self.training)
         if self.bias is not None:
             out = out + self.bias
         return out
@@ -234,7 +239,8 @@ class MemristorConv2d(nn.Module):
             W_flat,
             self.device_model,
             t=t,
-            seed=seed
+            seed=seed,
+            training=self.training
         )
 
         # Transpose back: [batch, out_channels, num_patches]

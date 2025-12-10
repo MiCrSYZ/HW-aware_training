@@ -100,8 +100,9 @@ def sanity_check_layer(
         print()
     
     # 2. Hardware forward pass with adaptive mapping
+    # Use training=False to enable IR-drop in paper mode for sanity check
     out_hw, debug_info = hardware_linear_forward_adaptive(
-        x, W, device_model, t=0, seed=42
+        x, W, device_model, t=0, seed=42, training=False
     )
     Gp_noisy, Gn_noisy, W_eff_conductance, scale = debug_info
     

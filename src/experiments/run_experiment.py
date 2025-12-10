@@ -46,6 +46,69 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def compute_boundary_regularization(
+    model: nn.Module,
+    device_model: MemristorDeviceModel,
+    beta: float = 0.8,
+) -> torch.Tensor:
+    """
+    计算远离边界的正则化损失。
+    
+    L_boundary(W) = (1/N) * sum_i (max(|W_i| - β*w_max, 0))^2
+    
+    Args:
+        model: 模型（可能是 MemristorModel wrapper，需要访问 base_model）
+        device_model: MemristorDeviceModel 实例，包含 wmax 信息
+        beta: 边界阈值比例，默认 0.8
+        
+    Returns:
+        正则化损失值（标量）
+    """
+    # 获取实际的模型
+    target_model = model
+    if hasattr(model, 'base_model'):
+        target_model = model.base_model
+    
+    # 获取 wmax（权重裁剪上界）
+    wmax = device_model.wmax
+    
+    # 计算阈值
+    threshold = beta * wmax
+    
+    total_reg = None
+    total_params = 0
+    
+    # 遍历所有 memristor 层
+    for module in target_model.modules():
+        # 检查是否是 memristor 层（有权重参数）
+        if hasattr(module, 'weight') and module.weight is not None:
+            # 检查是否是 memristor 相关的层
+            # MemristorLinear, MemristorConv2d, 以及 learned mapping 的层都有 weight
+            module_name = type(module).__name__
+            if 'Memristor' in module_name or hasattr(module, 'device_model'):
+                W = module.weight
+                N = W.numel()
+                
+                # 计算远离边界的正则化
+                # max(|W_i| - β*w_max, 0)^2
+                abs_W = torch.abs(W)
+                excess = torch.clamp(abs_W - threshold, min=0.0)
+                layer_reg = (excess ** 2).sum() / N
+                
+                if total_reg is None:
+                    total_reg = layer_reg
+                else:
+                    total_reg = total_reg + layer_reg
+                total_params += 1
+    
+    if total_params > 0:
+        return total_reg
+    else:
+        # 如果没有找到 memristor 层，返回零张量
+        device = next(model.parameters()).device if len(list(model.parameters())) > 0 else torch.device('cpu')
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+
 def run_experiment(
     config: Dict[str, Any],
     output_dir: str,
@@ -342,7 +405,7 @@ def run_experiment(
             compensation_method = config['experiment'].get('compensation_method', 'hat')
             if compensation_method == 'hat':
                 train_metrics = _train_hat(
-                    model, train_loader, criterion, optimizer, device, epoch, device_model
+                    model, train_loader, criterion, optimizer, device, epoch, device_model, config
                 )
             elif compensation_method == 'learned_mapping':
                 train_metrics = _train_learned_mapping(
@@ -363,9 +426,17 @@ def run_experiment(
         # 应用写入更新（根据 write_interval）
         # 如果 write_interval = epochs，则在训练循环结束后执行（避免重复）
         # 否则，在训练循环中按间隔执行
+        # 注意：对于 learned_mapping (post_train模式)，跳过训练循环中的 writeback，
+        #       因为最终会在 post-train 阶段写入 W_final = W_fp + ΔW
+        compensation_method = config['experiment'].get('compensation_method', 'hat')
+        post_train_config = config['experiment'].get('post_train', {})
+        use_post_train = post_train_config.get('enabled', False)
+        skip_writeback_in_training = (compensation_method == 'learned_mapping' and use_post_train)
+        
         if (experiment_mode != 'baseline' and 
             device_model and 
             device_model.enable_update_model and 
+            not skip_writeback_in_training and  # 跳过 learned_mapping post_train 模式的训练循环写入
             write_interval < epochs and  # 只在非一次性写入时在训练循环中执行
             (epoch + 1) % write_interval == 0):
             experiment_logger.info(f"Applying writeback at epoch {epoch}")
@@ -523,7 +594,7 @@ def run_experiment(
         
         experiment_logger.info(f"Post-train parameters: epochs={post_train_num_epochs}, "
                               f"lr={post_train_lr}, lambda_reg={post_train_lambda_reg}")
-        experiment_logger.info("Starting post-train mapping_net training (each epoch will be logged below):")
+        experiment_logger.info("Starting post-train mapping_net training:")
         
         # Train mapping_net while freezing main model
         # train_weight_mapping will log each epoch internally
@@ -545,12 +616,93 @@ def run_experiment(
                               f"Best: val_acc={mapping_results.get('best_val_acc', 0.0):.2f}%, "
                               f"loss={mapping_results.get('best_loss', 0.0):.4f}")
         
-        # Re-validate with trained mapping_net
+        # Compute W_final = W_fp + ΔW for learned mapping
+        # W_fp is the trained main model weights (already in model)
+        # ΔW is computed by mapping_net from W_noisy (W_fp with non-idealities)
+        experiment_logger.info("Computing W_final = W_fp + ΔW for all layers...")
+        mapping_net.eval()
+        with torch.no_grad():
+            for module in target_model.modules():
+                if not hasattr(module, 'weight') or module.weight is None:
+                    continue
+                
+                # W_fp: current weight (trained main model)
+                W_fp = module.weight.data.clone()
+                
+                # Compute W_noisy: W_fp with non-idealities applied
+                # This simulates what would be read from hardware
+                Gp, Gn, max_abs = device_model.map_weights_to_conductance_diff_adaptive(W_fp)
+                Gp_noisy = device_model.apply_nonidealities(Gp, t=0, seed=None)
+                Gn_noisy = device_model.apply_nonidealities(Gn, t=0, seed=None)
+                G_range = device_model.G_max - device_model.G_min
+                scale_back = max_abs / (G_range + 1e-12)
+                scale_back = torch.clamp(scale_back, min=1e-9, max=1e9)
+                W_noisy = (Gp_noisy - Gn_noisy) * scale_back
+                
+                # Compute ΔW using mapping_net
+                # Estimate noise_scale for mapping_net
+                noise_est = (W_noisy - W_fp).abs()
+                est_mean = float(noise_est.mean().detach().cpu().item() + 1e-12)
+                min_noise_scale = 1e-8
+                max_noise_scale = 0.5 * (device_model.wmax - device_model.wmin)
+                noise_scale = float(min(max(est_mean, min_noise_scale), max_noise_scale))
+                
+                # Get delta from mapping_net
+                # Determine layer type and conv_shape
+                if isinstance(module, nn.Conv2d):
+                    layer_type = 'conv'
+                    conv_shape = (module.out_channels, module.in_channels, 
+                                 module.kernel_size[0] if isinstance(module.kernel_size, tuple) else module.kernel_size,
+                                 module.kernel_size[1] if isinstance(module.kernel_size, tuple) else module.kernel_size)
+                else:
+                    layer_type = 'linear'
+                    conv_shape = None
+                
+                delta_W = mapping_net(W_noisy, noise_scale=noise_scale, layer_type=layer_type, conv_shape=conv_shape)
+                
+                # Apply safety clamping (same as in hardware_linear_forward_with_weight_mapping)
+                mapping_max_frac = float(config['experiment'].get('mapping_max_frac', 0.5))
+                bound = mapping_max_frac * (W_noisy.abs() + 1e-9)
+                delta_W = torch.max(torch.min(delta_W, bound), -bound)
+                abs_clip = (device_model.wmax - device_model.wmin) * 0.5
+                delta_W = torch.clamp(delta_W, -abs_clip, abs_clip)
+                
+                # Compute W_final = W_fp + ΔW
+                W_final = W_fp + delta_W
+                
+                # Clamp to allowed weight range
+                W_final = torch.clamp(W_final, device_model.wmin, device_model.wmax)
+                
+                # Update module weight to W_final
+                module.weight.data.copy_(W_final)
+        
+        experiment_logger.info("W_final = W_fp + ΔW computed and stored in model weights")
+        
+        # Write W_final to hardware (if writeback is enabled)
+        if (device_model and device_model.enable_update_model):
+            experiment_logger.info("Writing W_final to hardware...")
+            _apply_writeback(
+                model, device_model,
+                write_t_min, write_t_scale, write_V_write,
+                max_pulses=write_max_pulses,
+                tolerance=write_tolerance
+            )
+            experiment_logger.info("W_final written to hardware")
+        else:
+            experiment_logger.info("Writeback disabled, skipping hardware write")
+        
+        # Disable mapping_net for inference (compensation is now baked into weights)
+        experiment_logger.info("Disabling mapping_net for inference (compensation baked into weights)")
+        for module in target_model.modules():
+            if hasattr(module, 'set_learned_mapping'):
+                module.set_learned_mapping(None)
+        
+        # Re-validate with W_final (mapping_net disabled, using hardware weights)
         if val_loader is not None:
             val_metrics = _validate_memristor(
                 model, val_loader, criterion, device, device_model
             )
-            experiment_logger.info(f"Post-train validation: acc={val_metrics['acc1']:.2f}%, "
+            experiment_logger.info(f"Post-writeback validation: acc={val_metrics['acc1']:.2f}%, "
                                   f"loss={val_metrics['loss']:.4f}")
             
             # Update best_acc if improved
@@ -564,7 +716,7 @@ def run_experiment(
                     'best_acc': best_acc,
                     'config': config,
                 }
-                # Save mapping_net state
+                # Save mapping_net state (for reference, though it's disabled)
                 checkpoint_data['mapping_net_state_dict'] = mapping_net.state_dict()
                 save_checkpoint(checkpoint_data, best_model_path, is_best=True)
                 experiment_logger.info(f"Saved best model after post-train with acc={best_acc:.2f}%")
@@ -581,9 +733,17 @@ def run_experiment(
     
     # 在训练循环结束后、最终测试前，如果 write_interval = epochs，执行最后一次 writeback
     # 这确保最终测试使用的是经过写入更新后的权重
+    # 注意：对于 learned_mapping (post_train模式)，跳过这里的 writeback，
+    #       因为已经在 post-train 阶段写入了 W_final = W_fp + ΔW
+    compensation_method = config['experiment'].get('compensation_method', 'hat')
+    post_train_config = config['experiment'].get('post_train', {})
+    use_post_train = post_train_config.get('enabled', False)
+    skip_writeback_after_training = (compensation_method == 'learned_mapping' and use_post_train)
+    
     if (experiment_mode != 'baseline' and 
         device_model and 
         device_model.enable_update_model and 
+        not skip_writeback_after_training and  # 跳过 learned_mapping post_train 模式的训练后写入
         write_interval == epochs):
         experiment_logger.info("Applying final writeback before test evaluation")
         _apply_writeback(
@@ -767,7 +927,17 @@ def _train_learned_mapping(
             except TypeError:
                 output = model(data)
             
-            loss = criterion(output, target)
+            loss_task = criterion(output, target)
+            
+            # Boundary regularization (if enabled)
+            loss = loss_task
+            boundary_reg_config = config.get('experiment', {}).get('boundary_regularization', {})
+            if boundary_reg_config.get('enabled', False):
+                lambda_boundary = float(boundary_reg_config.get('lambda', 1e-4))
+                beta = float(boundary_reg_config.get('beta', 0.8))
+                boundary_reg = compute_boundary_regularization(model, device_model, beta=beta)
+                loss = loss_task + lambda_boundary * boundary_reg
+            
             loss.backward()
             optimizer.step()
             
@@ -879,7 +1049,16 @@ def _train_learned_mapping(
             except TypeError:
                 output = model(data)
             
-            loss = criterion(output, target)
+            loss_task = criterion(output, target)
+            
+            # Boundary regularization (if enabled)
+            loss = loss_task
+            boundary_reg_config = config.get('experiment', {}).get('boundary_regularization', {})
+            if boundary_reg_config.get('enabled', False):
+                lambda_boundary = float(boundary_reg_config.get('lambda', 1e-4))
+                beta = float(boundary_reg_config.get('beta', 0.8))
+                boundary_reg = compute_boundary_regularization(model, device_model, beta=beta)
+                loss = loss_task + lambda_boundary * boundary_reg
             
             # Backward pass to update main model weights
             # mapping_net parameters are frozen, so only main model weights will be updated
@@ -957,6 +1136,9 @@ def _train_hybrid(
         gamma = float(joint_hat_config.get('gamma', 1e-5))
         t_step = epoch * len(train_loader)
         
+        # Get boundary regularization config
+        boundary_reg_config = config.get('experiment', {}).get('boundary_regularization', {})
+        
         return joint_hat_mapping_train(
             model=model,
             mapping_net=mapping_net,
@@ -971,6 +1153,7 @@ def _train_hybrid(
             beta=beta,
             gamma=gamma,
             t_step=t_step,
+            boundary_reg_config=boundary_reg_config,
         )
     else:
         # Use two-stage hybrid_compensation_train
@@ -982,6 +1165,9 @@ def _train_hybrid(
         mapping_alpha = float(config['experiment'].get('mapping_alpha', 0.5))
         mapping_lambda_reg = float(config['experiment'].get('mapping_lambda_reg', 1e-4))
         mapping_max_frac = float(config['experiment'].get('mapping_max_frac', 0.5))
+        
+        # Get boundary regularization config
+        boundary_reg_config = config.get('experiment', {}).get('boundary_regularization', {})
         
         return hybrid_compensation_train(
             model=model,
@@ -999,6 +1185,7 @@ def _train_hybrid(
             mapping_lr=mapping_lr,
             mapping_alpha=mapping_alpha,
             mapping_lambda_reg=mapping_lambda_reg,
+            boundary_reg_config=boundary_reg_config,
         )
 
 
@@ -1277,6 +1464,7 @@ def _train_hat(
     device: torch.device,
     epoch: int,
     device_model: MemristorDeviceModel,
+    config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
     """Hardware-aware training with non-idealities during forward.
     
@@ -1318,7 +1506,18 @@ def _train_hat(
             # Fallback if model doesn't accept t parameter
             output = model(data)
         
-        loss = criterion(output, target)
+        loss_task = criterion(output, target)
+        
+        # Boundary regularization (if enabled)
+        loss = loss_task
+        if config is not None:
+            boundary_reg_config = config.get('experiment', {}).get('boundary_regularization', {})
+            if boundary_reg_config.get('enabled', False):
+                lambda_boundary = float(boundary_reg_config.get('lambda', 1e-4))
+                beta = float(boundary_reg_config.get('beta', 0.8))
+                boundary_reg = compute_boundary_regularization(model, device_model, beta=beta)
+                loss = loss_task + lambda_boundary * boundary_reg
+        
         loss.backward()
         optimizer.step()
         
