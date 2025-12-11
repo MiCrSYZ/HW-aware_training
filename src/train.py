@@ -17,9 +17,9 @@ try:
     from .experiments.visualize import plot_accuracy_curve
     from .utils.seeds import set_seed
 except ImportError:
-    from experiments.run_experiment import run_experiment
-    from experiments.visualize import plot_accuracy_curve
-    from utils.seeds import set_seed
+    from src.experiments.run_experiment import run_experiment
+    from src.experiments.visualize import plot_accuracy_curve
+    from src.utils.seeds import set_seed
 
 
 def load_config(config_path: str) -> dict:
