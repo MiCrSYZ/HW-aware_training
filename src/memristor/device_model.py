@@ -651,16 +651,18 @@ class MemristorDeviceModel:
         x: torch.Tensor,
         W: torch.Tensor,
         adc_bits: Optional[int] = None,
+        per_tile_quant: bool = True,
     ) -> torch.Tensor:
         """
-        带tiling和ADC量化的矩阵乘法。
+        带tiling的矩阵乘法。
         
-        将大矩阵按array_size分块，每个tile的输出经过ADC量化，然后累加。
+        将大矩阵按array_size分块计算。
         
         Args:
             x: 输入张量 [batch, in_dim]
             W: 权重矩阵 [out_dim, in_dim]
             adc_bits: ADC位数（如果为None，使用self.adc_bits）
+            per_tile_quant: 如果True，每个tile输出后量化；如果False，不量化（用于Conv2d的patch内计算）
             
         Returns:
             y: 输出张量 [batch, out_dim]
@@ -700,8 +702,8 @@ class MemristorDeviceModel:
                 # 矩阵乘法
                 y_partial = torch.matmul(x_tile, W_tile.T)  # [batch, tile_out]
                 
-                # ADC量化
-                if self.enable_adc:
+                # Per-tile ADC量化（仅在per_tile_quant=True且enable_adc=True时）
+                if per_tile_quant and self.enable_adc:
                     y_partial = self.adc_quant(y_partial, bits=adc_bits)
                 
                 # 累加到输出

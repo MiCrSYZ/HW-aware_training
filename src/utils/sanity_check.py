@@ -13,7 +13,7 @@ from typing import Tuple
 
 try:
     from ..memristor.device_model import MemristorDeviceModel
-    from ..models.memristor_wrappers import hardware_linear_forward_adaptive
+    from ..memristor.memristor_wrappers import hardware_linear_forward_adaptive
 except ImportError:
     import sys
     import os
@@ -24,7 +24,7 @@ except ImportError:
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
     from src.memristor.device_model import MemristorDeviceModel
-    from src.models.memristor_wrappers import hardware_linear_forward_adaptive
+    from src.memristor.memristor_wrappers import hardware_linear_forward_adaptive
 
 
 def sanity_check_layer(

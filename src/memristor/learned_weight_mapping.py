@@ -90,122 +90,116 @@ def hardware_linear_forward_with_weight_mapping(
     seed: Optional[int] = None,
     enable_sanity_check: bool = True,
     max_frac: float = 0.5,
+    per_tile_quant: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-
+    """
+    Hardware forward pass with learned weight mapping.
+    
+    New logic:
+    1. delta_W = mapping_net(W_fp)  # mapping_net takes clean weights as input
+    2. W_pre = W_fp + delta_W
+    3. W_pre = clamp(W_pre, wmin, wmax)
+    4. out = hardware_linear_forward_adaptive(x, W_pre)  # Use HAT's forward function
+    
+    Args:
+        x: Input tensor
+        W: Clean floating-point weights (W_fp)
+        device_model: MemristorDeviceModel instance
+        mapping_net: WeightMappingNet instance (optional)
+        t: Time/cycle index for drift
+        seed: Random seed for reproducibility
+        enable_sanity_check: Whether to enable debug output
+        max_frac: Max fraction for delta clamping
+        per_tile_quant: Whether to use per-tile quantization
+        
+    Returns:
+        Output tensor and debug info
+    """
     debug: Dict[str, Any] = {}
-    eps = 1e-12
-
-    # --- STEP 1: compute a single weight-space noisy estimate W_noisy (ONE non-ideal pass) ---
-    if hasattr(device_model, 'apply_noise_to_weights'):
-        W_noisy = device_model.apply_noise_to_weights(W, t=t, seed=seed)
-    else:
-        # map -> apply_nonidealities once -> map back
-        Gp, Gn, max_abs = device_model.map_weights_to_conductance_diff_adaptive(W)
-        Gp_noisy = device_model.apply_nonidealities(Gp, t=t, seed=seed)
-        Gn_noisy = device_model.apply_nonidealities(Gn, t=t, seed=(None if seed is None else seed+1))
-        G_range = (device_model.G_max - device_model.G_min)
-        scale_back = max_abs / (G_range + eps)
-        scale_back = torch.clamp(scale_back, min=1e-9, max=1e9)
-        W_noisy = (Gp_noisy - Gn_noisy) * scale_back
-
-    # keep debug
-    with torch.no_grad():
-        debug['W_noisy_mean'] = float(W_noisy.mean().detach().cpu().item())
-        debug['W_mean'] = float(W.mean().detach().cpu().item())
-
-    # --- STEP 2: compute mapping_net delta (if provided)  ---
-    delta_W = None
-    noise_scale = None
-    if mapping_net is not None:
-        # compute a robust noise_scale: mean absolute difference, but clamp
-        with torch.no_grad():
-            noise_est = (W_noisy - W).abs()
-            est_mean = float(noise_est.mean().detach().cpu().item() + 1e-12)
-
-            # Bound noise_scale to avoid pathological scale (user-tweakable)
-            min_noise_scale = 1e-8
-            max_noise_scale = 0.5 * (device_model.wmax - device_model.wmin)  # at most half-range
-            noise_scale = float(min(max(est_mean, min_noise_scale), max_noise_scale))
-
-        # mapping_net MUST accept W_noisy (so it can see the corruption)
-        # mapping_net returns a delta in weight space
-        delta_W = mapping_net(W_noisy, noise_scale=noise_scale, layer_type='linear', conv_shape=None)
-
-        # Safety clamp: don't allow delta to exceed a fraction of current magnitude
-        # max_frac can be tuned (start conservative, configurable via parameter)
-        # compute per-element bounds: max_frac * (|W_noisy| + small_eps)
-        bound = max_frac * (W_noisy.abs() + 1e-9)
-        delta_W = torch.max(torch.min(delta_W, bound), -bound)
-
-        # Extra guard: absolute clamp (global) in case W_noisy small
-        abs_clip = (device_model.wmax - device_model.wmin) * 0.5
-        delta_W = torch.clamp(delta_W, -abs_clip, abs_clip)
-
-        with torch.no_grad():
-            debug['delta_mean'] = float(delta_W.mean().detach().cpu().item())
-            debug['delta_max_abs'] = float(delta_W.abs().max().detach().cpu().item())
-            debug['noise_scale'] = noise_scale
-    else:
+    
+    # Import hardware_linear_forward_adaptive from memristor_wrappers
+    try:
+        from .memristor_wrappers import hardware_linear_forward_adaptive
+    except ImportError:
+        from src.memristor.memristor_wrappers import hardware_linear_forward_adaptive
+    
+    # W is W_fp (clean floating-point weights)
+    W_fp = W
+    
+    # If mapping_net is None, directly use HAT's forward (same as HAT)
+    if mapping_net is None:
+        out, debug_info = hardware_linear_forward_adaptive(
+            x, W_fp, device_model, t=t, seed=seed, training=True
+        )
+        debug['W_fp_mean'] = float(W_fp.mean().detach().cpu().item())
         debug['delta_mean'] = None
         debug['noise_scale'] = None
-
-    # --- STEP 3: form W_corrected but DO NOT re-apply device non-idealities ---
-    if delta_W is not None:
-        W_corrected = W_noisy + delta_W
-    else:
-        W_corrected = W_noisy
-
-    # clamp corrected weights into allowed range (very important)
-    if hasattr(device_model, 'wmin') and hasattr(device_model, 'wmax'):
-        W_corrected = torch.clamp(W_corrected, device_model.wmin, device_model.wmax)
-
+        return out, {'W_pre': W_fp, 'debug': debug}
+    
+    # --- STEP 1: Compute delta_W from mapping_net ---
+    # mapping_net takes W_fp as input: delta_W = mapping_net(W_fp)
+    noise_scale = None
     with torch.no_grad():
-        debug['W_corrected_mean'] = float(W_corrected.mean().detach().cpu().item())
-
-    # If W_corrected contains NaN/Inf, fallback
-    if torch.isnan(W_corrected).any() or torch.isinf(W_corrected).any():
-        # restore fallback and warn
+        noise_scale_est = float(W_fp.std().detach().cpu().item() + 1e-12)
+        min_noise_scale = 1e-8
+        max_noise_scale = 0.5 * (device_model.wmax - device_model.wmin)
+        noise_scale = float(min(max(noise_scale_est, min_noise_scale), max_noise_scale))
+    
+    delta_W = mapping_net(W_fp, noise_scale=noise_scale, layer_type='linear', conv_shape=None)
+    
+    # Apply safety clamping to delta_W
+    bound = max_frac * (W_fp.abs() + 1e-9)
+    delta_W = torch.max(torch.min(delta_W, bound), -bound)
+    abs_clip = (device_model.wmax - device_model.wmin) * 0.5
+    delta_W = torch.clamp(delta_W, -abs_clip, abs_clip)
+    
+    with torch.no_grad():
+        debug['delta_mean'] = float(delta_W.mean().detach().cpu().item())
+        debug['delta_max_abs'] = float(delta_W.abs().max().detach().cpu().item())
+        debug['noise_scale'] = noise_scale
+    
+    # --- STEP 2: Compute W_pre = W_fp + delta_W ---
+    W_pre = W_fp + delta_W
+    
+    # --- STEP 3: Clamp W_pre to allowed range ---
+    if hasattr(device_model, 'wmin') and hasattr(device_model, 'wmax'):
+        W_pre = torch.clamp(W_pre, device_model.wmin, device_model.wmax)
+    
+    with torch.no_grad():
+        debug['W_fp_mean'] = float(W_fp.mean().detach().cpu().item())
+        debug['W_pre_mean'] = float(W_pre.mean().detach().cpu().item())
+    
+    # Check for NaN/Inf
+    if torch.isnan(W_pre).any() or torch.isinf(W_pre).any():
         import logging
         logger = logging.getLogger(__name__)
-        logger.warning("W_corrected contains NaN/Inf, falling back to original W")
-        W_corrected = W
-
-    # --- STEP 4: use W_corrected as final effective weight; DO NOT map->apply_nonidealities again ---
-    W_eff = W_corrected
-
-    # decide tiling or direct linear
-    use_tiling = (hasattr(device_model, 'array_size') and
-                  device_model.array_size > 0 and
-                  (W_eff.size(0) > device_model.array_size or W_eff.size(1) > device_model.array_size))
-
-    if use_tiling:
-        out = device_model.matmul_with_tiling(x, W_eff, adc_bits=device_model.adc_bits)
-    else:
-        import torch.nn.functional as F
-        out = F.linear(x, W_eff)
-        if hasattr(device_model, 'enable_adc') and device_model.enable_adc:
-            out = device_model.adc_quant(out, bits=device_model.adc_bits)
+        logger.warning("W_pre contains NaN/Inf, falling back to W_fp")
+        W_pre = W_fp
+    
+    # --- STEP 4: Forward pass using hardware_linear_forward_adaptive (same as HAT) ---
+    # Use the same forward function as HAT
+    out, debug_info = hardware_linear_forward_adaptive(
+        x, W_pre, device_model, t=t, seed=seed, training=True
+    )
+    
+    # Store debug info
+    debug.update({
+        'Gp_noisy': debug_info[0] if len(debug_info) > 0 else None,
+        'Gn_noisy': debug_info[1] if len(debug_info) > 1 else None,
+    })
 
     # Final debug
     if enable_sanity_check:
-        # extra safety checks & prints
-        small_warning = False
-        if debug['delta_mean'] is not None and abs(debug['delta_mean']) > 0.5 * abs(debug['W_noisy_mean'] + 1e-12):
-            small_warning = True
-
         print("\n=== mapping-forward sanity ===")
-        print(f"W mean: {debug['W_mean']:.6e}")
-        print(f"W_noisy mean: {debug['W_noisy_mean']:.6e}")
+        print(f"W_fp mean: {debug['W_fp_mean']:.6e}")
+        print(f"W_pre mean: {debug['W_pre_mean']:.6e}")
         if debug['delta_mean'] is not None:
             print(f"delta mean: {debug['delta_mean']:.6e}, delta_max_abs: {debug['delta_max_abs']:.6e}, noise_scale: {debug['noise_scale']:.6e}")
-            print(f"W_corrected mean: {debug['W_corrected_mean']:.6e}")
-            if small_warning:
-                print("!!! WARNING: delta magnitude seems large relative to W_noisy mean. Check alpha/max_frac.")
         else:
             print("mapping_net is None (no correction applied).")
         print("=" * 30 + "\n", flush=True)
 
-    return out, {'W_eff': W_eff, 'debug': debug}
+    return out, {'W_pre': W_pre, 'debug': debug}
 
 
 # --- Wrap into MemristorLinear replacement class ---
@@ -229,9 +223,11 @@ class MemristorLinear(nn.Module):
         self.mapping_net = mapping_net
 
     def forward(self, x: torch.Tensor, t: int = 0, seed: Optional[int] = None, enable_sanity_check: bool = False):
+        # For Linear layers: per-tile quant if enable_adc=True
+        per_tile_quant = hasattr(self.device_model, 'enable_adc') and self.device_model.enable_adc
         out, info = hardware_linear_forward_with_weight_mapping(
             x, self.weight, self.device_model, mapping_net=self.mapping_net, t=t, seed=seed,
-            enable_sanity_check=enable_sanity_check, max_frac=self.mapping_max_frac
+            enable_sanity_check=enable_sanity_check, max_frac=self.mapping_max_frac, per_tile_quant=per_tile_quant
         )
         if self.bias is not None:
             out = out + self.bias
@@ -289,6 +285,7 @@ class MemristorConv2d(nn.Module):
         x_flat = x_unfold.transpose(1, 2)
 
         # Apply hardware mapping with learned mapping
+        # For Conv2d: patch内只tile不quant，输出patch-level float32
         out_flat, info = hardware_linear_forward_with_weight_mapping(
             x_flat,
             W_flat,
@@ -297,7 +294,8 @@ class MemristorConv2d(nn.Module):
             t=t,
             seed=seed,
             enable_sanity_check=enable_sanity_check,
-            max_frac=self.mapping_max_frac
+            max_frac=self.mapping_max_frac,
+            per_tile_quant=False  # No per-tile quant for Conv2d patches
         )
 
         # Transpose back: [batch, out_channels, num_patches]
@@ -317,6 +315,11 @@ class MemristorConv2d(nn.Module):
         # Add bias
         if self.bias:
             out = out + self.bias_param.view(1, -1, 1, 1)
+        
+        # Apply ADC quantization on the final feature map (if enabled)
+        # All patches computed → fold back → feature map → one final ADC quant
+        if hasattr(self.device_model, 'enable_adc') and self.device_model.enable_adc:
+            out = self.device_model.adc_quant(out, bits=self.device_model.adc_bits)
 
         return out
 

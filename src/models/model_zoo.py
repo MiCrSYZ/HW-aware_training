@@ -11,7 +11,7 @@ from typing import Optional
 try:
     from .resnet20 import ResNet20
     from .vit_tiny import ViTTiny
-    from .memristor_wrappers import MemristorLinear, MemristorConv2d
+    from ..memristor.memristor_wrappers import MemristorLinear, MemristorConv2d
     from ..memristor.device_model import MemristorDeviceModel
     from ..memristor.learned_weight_mapping import (
         MemristorLinear as LearnedMappingMemristorLinear,
@@ -20,7 +20,7 @@ try:
 except ImportError:
     from src.models.resnet20 import ResNet20
     from src.models.vit_tiny import ViTTiny
-    from src.models.memristor_wrappers import MemristorLinear, MemristorConv2d
+    from src.memristor.memristor_wrappers import MemristorLinear, MemristorConv2d
     from src.memristor.device_model import MemristorDeviceModel
     from src.memristor.learned_weight_mapping import (
         MemristorLinear as LearnedMappingMemristorLinear,

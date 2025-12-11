@@ -14,7 +14,6 @@ try:
     from ..memristor.device_model import MemristorDeviceModel
     from ..memristor.compensation import (
         hardware_aware_training,
-        hybrid_compensation_train,
     )
     from ..memristor.learned_weight_mapping import (
         WeightMappingNet,
@@ -32,7 +31,6 @@ except ImportError:
     from src.memristor.device_model import MemristorDeviceModel
     from src.memristor.compensation import (
         hardware_aware_training,
-        hybrid_compensation_train,
     )
     from src.memristor.learned_weight_mapping import (
         WeightMappingNet,
@@ -266,9 +264,9 @@ def run_experiment(
             ir_drop_scaling=float(ir_drop_scaling),
         )
         
-        # Check if learned mapping is used (for learned_mapping or hybrid compensation)
+        # Check if learned mapping is used
         compensation_method = config['experiment'].get('compensation_method', 'hat')
-        use_learned_mapping = (compensation_method == 'learned_mapping' or compensation_method == 'hybrid')
+        use_learned_mapping = (compensation_method == 'learned_mapping')
         
         # Get mapping parameters from config
         mapping_max_frac = float(config['experiment'].get('mapping_max_frac', 0.5))
@@ -318,15 +316,7 @@ def run_experiment(
     
     # Scheduler
     scheduler = None
-    # For hybrid strategy, calculate total epochs from epoch_stage1 + epoch_stage2
-    if (config['experiment']['mode'] == 'memristor_with_comp' and 
-        config['experiment'].get('compensation_method') == 'hybrid'):
-        epoch_stage1 = int(config['experiment'].get('epoch_stage1', 50))
-        epoch_stage2 = int(config['experiment'].get('epoch_stage2', 50))
-        epochs = epoch_stage1 + epoch_stage2
-        experiment_logger.info(f"Hybrid strategy: epoch_stage1={epoch_stage1}, epoch_stage2={epoch_stage2}, total_epochs={epochs}")
-    else:
-        epochs = config.get('epochs', 100)  # Default to 100 epochs if not specified
+    epochs = config.get('epochs', 100)  # Default to 100 epochs if not specified
     
     # 读取写入间隔（如果未设置，默认为epochs，即训练完成后一次性写入）
     if config['experiment']['mode'] != 'baseline':
@@ -412,14 +402,9 @@ def run_experiment(
                     model, train_loader, val_loader, device_model, criterion, 
                     optimizer, device, epoch, config
                 )
-            elif compensation_method == 'hybrid':
-                train_metrics = _train_hybrid(
-                    model, train_loader, val_loader, device_model, criterion,
-                    optimizer, device, epoch, config
-                )
             else:
                 raise ValueError(f"Unknown compensation method: {compensation_method}. "
-                               f"Use 'hat', 'learned_mapping', or 'hybrid'.")
+                               f"Use 'hat' or 'learned_mapping'.")
         else:
             raise ValueError(f"Unknown experiment mode: {experiment_mode}")
         
@@ -562,9 +547,12 @@ def run_experiment(
             best_acc = max(best_acc, val_metrics['acc1'])
     
     # Post-train learned mapping if enabled
+    # Flow: Main network training (same as HAT) → W_fp → Mapping network training (no write_update) 
+    # → W_final = W_fp + ΔW → write_update → inference
     if use_post_train:
         experiment_logger.info("=" * 60)
         experiment_logger.info("Starting post-train learned mapping phase")
+        experiment_logger.info("Flow: Main training (HAT) → W_fp → Mapping training → W_final → write_update → inference")
         experiment_logger.info("=" * 60)
         
         # Initialize mapping network
@@ -617,8 +605,10 @@ def run_experiment(
                               f"loss={mapping_results.get('best_loss', 0.0):.4f}")
         
         # Compute W_final = W_fp + ΔW for learned mapping
-        # W_fp is the trained main model weights (already in model)
-        # ΔW is computed by mapping_net from W_noisy (W_fp with non-idealities)
+        # Flow: Main network training (same as HAT) → W_fp → Mapping network training (no write_update) 
+        # → W_final = W_fp + ΔW → write_update → inference
+        # W_fp is the trained main model weights (already in model, adapted to non-idealities via HAT)
+        # ΔW is computed by mapping_net from W_fp (mapping_net takes W_fp as input, not W_noisy)
         experiment_logger.info("Computing W_final = W_fp + ΔW for all layers...")
         mapping_net.eval()
         with torch.no_grad():
@@ -626,10 +616,10 @@ def run_experiment(
                 if not hasattr(module, 'weight') or module.weight is None:
                     continue
                 
-                # W_fp: current weight (trained main model)
+                # W_fp: current weight (trained main model, same as HAT result)
                 W_fp = module.weight.data.clone()
                 
-                # Compute W_noisy: W_fp with non-idealities applied
+                # Compute W_noisy: W_fp with non-idealities applied (for noise_scale estimation)
                 # This simulates what would be read from hardware
                 Gp, Gn, max_abs = device_model.map_weights_to_conductance_diff_adaptive(W_fp)
                 Gp_noisy = device_model.apply_nonidealities(Gp, t=0, seed=None)
@@ -639,7 +629,6 @@ def run_experiment(
                 scale_back = torch.clamp(scale_back, min=1e-9, max=1e9)
                 W_noisy = (Gp_noisy - Gn_noisy) * scale_back
                 
-                # Compute ΔW using mapping_net
                 # Estimate noise_scale for mapping_net
                 noise_est = (W_noisy - W_fp).abs()
                 est_mean = float(noise_est.mean().detach().cpu().item() + 1e-12)
@@ -648,6 +637,7 @@ def run_experiment(
                 noise_scale = float(min(max(est_mean, min_noise_scale), max_noise_scale))
                 
                 # Get delta from mapping_net
+                # Note: mapping_net takes W_fp as input (not W_noisy), as per learned_weight_mapping.py design
                 # Determine layer type and conv_shape
                 if isinstance(module, nn.Conv2d):
                     layer_type = 'conv'
@@ -658,7 +648,8 @@ def run_experiment(
                     layer_type = 'linear'
                     conv_shape = None
                 
-                delta_W = mapping_net(W_noisy, noise_scale=noise_scale, layer_type=layer_type, conv_shape=conv_shape)
+                # mapping_net takes W_fp as input (not W_noisy)
+                delta_W = mapping_net(W_fp, noise_scale=noise_scale, layer_type=layer_type, conv_shape=conv_shape)
                 
                 # Apply safety clamping (same as in hardware_linear_forward_with_weight_mapping)
                 mapping_max_frac = float(config['experiment'].get('mapping_max_frac', 0.5))
@@ -678,9 +669,10 @@ def run_experiment(
         
         experiment_logger.info("W_final = W_fp + ΔW computed and stored in model weights")
         
-        # Write W_final to hardware (if writeback is enabled)
+        # Write W_final to hardware using write_update (if enabled)
+        # This simulates the hardware programming process after computing W_final
         if (device_model and device_model.enable_update_model):
-            experiment_logger.info("Writing W_final to hardware...")
+            experiment_logger.info("Writing W_final to hardware using write_update...")
             _apply_writeback(
                 model, device_model,
                 write_t_min, write_t_scale, write_V_write,
@@ -689,7 +681,7 @@ def run_experiment(
             )
             experiment_logger.info("W_final written to hardware")
         else:
-            experiment_logger.info("Writeback disabled, skipping hardware write")
+            experiment_logger.info("Writeback disabled (enable_update_model=False), skipping hardware write")
         
         # Disable mapping_net for inference (compensation is now baked into weights)
         experiment_logger.info("Disabling mapping_net for inference (compensation baked into weights)")
@@ -734,7 +726,7 @@ def run_experiment(
     # 在训练循环结束后、最终测试前，如果 write_interval = epochs，执行最后一次 writeback
     # 这确保最终测试使用的是经过写入更新后的权重
     # 注意：对于 learned_mapping (post_train模式)，跳过这里的 writeback，
-    #       因为已经在 post-train 阶段写入了 W_final = W_fp + ΔW
+    #       因为已经在 post-train 阶段完成了：W_final = W_fp + ΔW → write_update
     compensation_method = config['experiment'].get('compensation_method', 'hat')
     post_train_config = config['experiment'].get('post_train', {})
     use_post_train = post_train_config.get('enabled', False)
@@ -880,8 +872,12 @@ def _train_learned_mapping(
     
     Supports two modes:
     1. Post-train mode (post_train.enabled=True): 
-       - Train main model first with W_noisy (non-idealities applied, no compensation)
-       - After main training, freeze main model and train mapping_net
+       - Train main model same as HAT (non-idealities applied during forward, 
+         weights updated via normal gradient descent) → get W_fp
+       - After main training, freeze main model and train mapping_net (no write_update)
+       - Compute W_final = W_fp + ΔW
+       - Call write_update to write W_final to hardware
+       - Inference with hardware weights
     2. Joint training mode (post_train.enabled=False):
        - Alternate between training mapping_net and main model each epoch
     """
@@ -890,12 +886,13 @@ def _train_learned_mapping(
     use_post_train = post_train_config.get('enabled', False)
     
     if use_post_train:
-        # Post-train mode: Train main model with W_noisy (non-idealities applied, no compensation)
+        # Post-train mode: Train main model same as HAT (non-idealities applied during forward, 
+        # but weights updated via normal gradient descent to get W_fp)
         # mapping_net will be trained after main model training completes
-        logger.info(f"Post-train mode: Training main model with W_noisy (no compensation, epoch {epoch})")
+        logger.info(f"Post-train mode: Training main model (same as HAT, epoch {epoch})")
         
         # Ensure no mapping_net is set during main model training
-        # This ensures we use W_noisy directly without any compensation
+        # This ensures we use non-idealities during forward but update weights normally
         target_model = model
         if hasattr(model, 'base_model'):
             target_model = model.base_model
@@ -907,8 +904,9 @@ def _train_learned_mapping(
             if hasattr(module, 'set_learned_mapping'):
                 module.set_learned_mapping(None)
         
-        # Train main model with W_noisy (non-idealities applied, but no compensation)
-        # The memristor layers will apply non-idealities to get W_noisy, then use W_noisy directly
+        # Train main model same as HAT: non-idealities applied during forward pass,
+        # but weights are updated via normal gradient descent (not W_noisy)
+        # This produces W_fp (float-point weights adapted to non-idealities)
         model.train()
         losses = AverageMeter('Loss', ':.4f')
         top1 = AverageMeter('Acc@1', ':6.2f')
@@ -918,8 +916,8 @@ def _train_learned_mapping(
             
             optimizer.zero_grad()
             
-            # Forward with non-idealities (W_noisy), but no compensation (mapping_net=None)
-            # This is different from HAT: HAT is a compensation strategy, here we use raw W_noisy
+            # Forward with non-idealities (same as HAT)
+            # Weights are updated via normal gradient descent, producing W_fp
             t = epoch * len(train_loader) + batch_idx
             seed = None  # Let randomness vary naturally
             try:
@@ -1074,119 +1072,6 @@ def _train_learned_mapping(
             'acc1': top1.avg,
             'mapping_loss': mapping_results.get('best_loss', 0.0),
         }
-
-
-def _train_hybrid(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    device_model: MemristorDeviceModel,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    device: torch.device,
-    epoch: int,
-    config: Dict[str, Any],
-) -> Dict[str, float]:
-    """
-    Train with hybrid compensation strategy (HAT + learned mapping).
-    
-    This function combines hardware-aware training and learned mapping
-    in a weighted loss function. Can use either hybrid_compensation_train
-    or joint_hat_mapping_train based on config.
-    """
-    # Initialize mapping network (create once, reuse across epochs)
-    if not hasattr(_train_hybrid, 'mapping_net'):
-        mapping_alpha = float(config['experiment'].get('mapping_alpha', 0.5))
-        _train_hybrid.mapping_net = WeightMappingNet(
-            hidden_dim=config['experiment'].get('mapping_hidden_dim', 32),
-            alpha=mapping_alpha
-        ).to(device)
-        _train_hybrid.mapping_optimizer = torch.optim.Adam(
-            _train_hybrid.mapping_net.parameters(),
-            lr=float(config['experiment'].get('mapping_lr', 1e-4))
-        )
-    
-    mapping_net = _train_hybrid.mapping_net
-    mapping_optimizer = _train_hybrid.mapping_optimizer
-    
-    # Set mapping network for all memristor layers
-    # If model is a MemristorModel wrapper, we need to access base_model
-    target_model = model
-    if hasattr(model, 'base_model'):
-        target_model = model.base_model
-        logger.info("_train_hybrid: Model is MemristorModel wrapper, accessing base_model")
-    
-    num_set = 0
-    for module in target_model.modules():
-        if hasattr(module, 'set_learned_mapping'):
-            module.set_learned_mapping(mapping_net)
-            num_set += 1
-    logger.info(f"_train_hybrid: Set mapping_net for {num_set} layers")
-    
-    # Check if joint_hat is enabled
-    joint_hat_config = config['experiment'].get('joint_hat', {})
-    use_joint_hat = joint_hat_config.get('enabled', False)
-    
-    if use_joint_hat:
-        # Use joint_hat_mapping_train with beta and gamma
-        # L = L_task + β * L_hw_mse + γ * L_reg
-        from ..memristor.compensation import joint_hat_mapping_train
-
-        beta = float(joint_hat_config.get('beta', 0.5))
-        gamma = float(joint_hat_config.get('gamma', 1e-5))
-        t_step = epoch * len(train_loader)
-        
-        # Get boundary regularization config
-        boundary_reg_config = config.get('experiment', {}).get('boundary_regularization', {})
-        
-        return joint_hat_mapping_train(
-            model=model,
-            mapping_net=mapping_net,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            device_model=device_model,
-            criterion=criterion,
-            optimizer=optimizer,
-            device=device,
-            epoch=epoch,
-            mapping_optimizer=mapping_optimizer,
-            beta=beta,
-            gamma=gamma,
-            t_step=t_step,
-            boundary_reg_config=boundary_reg_config,
-        )
-    else:
-        # Use two-stage hybrid_compensation_train
-        # Stage 1: HAT training (mapping_net=None, train W)
-        # Stage 2: Freeze W, train only mapping_net
-        epoch_stage1 = int(config['experiment'].get('epoch_stage1', 50))
-        epoch_stage2 = int(config['experiment'].get('epoch_stage2', 50))
-        mapping_lr = float(config['experiment'].get('mapping_lr', 1e-4))
-        mapping_alpha = float(config['experiment'].get('mapping_alpha', 0.5))
-        mapping_lambda_reg = float(config['experiment'].get('mapping_lambda_reg', 1e-4))
-        mapping_max_frac = float(config['experiment'].get('mapping_max_frac', 0.5))
-        
-        # Get boundary regularization config
-        boundary_reg_config = config.get('experiment', {}).get('boundary_regularization', {})
-        
-        return hybrid_compensation_train(
-            model=model,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            device_model=device_model,
-            criterion=criterion,
-            optimizer=optimizer,
-            device=device,
-            epoch=epoch,
-            mapping_net=mapping_net,
-            mapping_optimizer=mapping_optimizer,
-            stage1_epochs=epoch_stage1,
-            stage2_epochs=epoch_stage2,
-            mapping_lr=mapping_lr,
-            mapping_alpha=mapping_alpha,
-            mapping_lambda_reg=mapping_lambda_reg,
-            boundary_reg_config=boundary_reg_config,
-        )
 
 
 def _sync_weights_to_memristor_model(base_model: nn.Module, memristor_model: nn.Module) -> None:
