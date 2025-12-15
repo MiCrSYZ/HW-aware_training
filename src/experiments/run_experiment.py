@@ -181,6 +181,7 @@ def run_experiment(
         adc_bits = memristor_config.get('adc_bits', 8)
         enable_update_model = memristor_config.get('enable_update_model', False)
         enable_adc = memristor_config.get('enable_adc', False)
+        adc_add_noise = memristor_config.get('adc_add_noise', False)
         enable_energy = memristor_config.get('enable_energy', False)
         
         # 读取更新模型参数
@@ -225,6 +226,10 @@ def run_experiment(
         ir_drop_mode = memristor_config.get('ir_drop_mode', 'none')
         ir_drop_gamma = memristor_config.get('ir_drop_gamma', 0.35)
         ir_drop_scaling = memristor_config.get('ir_drop_scaling', 1.0)
+        # crossbar模式参数
+        ir_drop_eta = memristor_config.get('ir_drop_eta', 1.0)
+        ir_drop_cap = memristor_config.get('ir_drop_cap', 0.10)
+        ir_drop_norm = memristor_config.get('ir_drop_norm', 'mean')
         
         # 读取写入更新参数
         write_config = memristor_config.get('write', {})
@@ -253,6 +258,7 @@ def run_experiment(
             adc_bits=int(adc_bits),
             enable_update_model=bool(enable_update_model),
             enable_adc=bool(enable_adc),
+            adc_add_noise=bool(adc_add_noise),
             enable_energy=bool(enable_energy),
             update_params=update_params,
             energy_coefs=energy_coefs,
@@ -262,6 +268,9 @@ def run_experiment(
             ir_drop_mode=str(ir_drop_mode),
             ir_drop_gamma=float(ir_drop_gamma),
             ir_drop_scaling=float(ir_drop_scaling),
+            ir_drop_eta=float(ir_drop_eta),
+            ir_drop_cap=float(ir_drop_cap),
+            ir_drop_norm=str(ir_drop_norm),
         )
         
         # Check if learned mapping is used

@@ -58,6 +58,7 @@ class MemristorDeviceModel:
         adc_bits: int = 8,  # ADC量化位数
         enable_update_model: bool = False,  # 启用状态依赖写入模型
         enable_adc: bool = False,  # 启用ADC量化
+        adc_add_noise: bool = False,  # ADC量化是否添加噪声
         enable_energy: bool = False,  # 启用能耗估计
         # 写入更新模型参数
         update_params: Optional[Dict[str, float]] = None,
@@ -67,9 +68,13 @@ class MemristorDeviceModel:
         drift_time_mode: str = 'accumulate',  # 'fixed' 或 'accumulate'
         drift_time_fixed: int = 0,  # 固定值模式下的t值
         # 新的IR-drop模型参数（基于论文方程16-18）
-        ir_drop_mode: str = 'none',  # 'none' | 'simple' | 'paper'
-        ir_drop_gamma: float = 0.35,  # 导线电阻缩放因子
-        ir_drop_scaling: float = 1.0,  # IR-drop校正项的最终缩放因子
+        ir_drop_mode: str = 'none',  # 'none' | 'simple' | 'paper' | 'crossbar'
+        ir_drop_gamma: float = 0.35,  # 导线电阻缩放因子（paper模式）
+        ir_drop_scaling: float = 1.0,  # IR-drop校正项的最终缩放因子（paper模式）
+        # crossbar模式参数
+        ir_drop_eta: float = 1.0,  # 位置因子幂次（crossbar模式）
+        ir_drop_cap: float = 0.10,  # 单列最大衰减上限（crossbar模式）
+        ir_drop_norm: str = 'mean',  # 列活动归一化方式（crossbar模式）：'mean' 或 'max'
     ):
         self.G_min = G_min
         self.G_max = G_max
@@ -87,6 +92,7 @@ class MemristorDeviceModel:
         self.adc_bits = adc_bits
         self.enable_update_model = enable_update_model
         self.enable_adc = enable_adc
+        self.adc_add_noise = adc_add_noise
         self.enable_energy = enable_energy
         
         # 写入更新模型参数（默认值）
@@ -126,6 +132,10 @@ class MemristorDeviceModel:
         self.ir_drop_mode = ir_drop_mode
         self.ir_drop_gamma = ir_drop_gamma
         self.ir_drop_scaling = ir_drop_scaling
+        # crossbar模式参数
+        self.ir_drop_eta = ir_drop_eta
+        self.ir_drop_cap = ir_drop_cap
+        self.ir_drop_norm = ir_drop_norm
         
         # 存储 seed 用于生成固定的 stuck mask
         self.seed = seed
@@ -358,7 +368,7 @@ class MemristorDeviceModel:
                 G = torch.where(non_stuck_mask, G * drift_factor, G)
         
         # 5. IR-drop: 交叉阵列中因导线电阻导致的电压降 - 只应用于非 stuck 的 cell
-        if self.ir_drop_beta > 0:
+        if self.ir_drop_mode == 'simple' and self.ir_drop_beta > 0:
             # Uniform scaling: 只对非 stuck 的 cell 应用 IR-drop
             G = torch.where(non_stuck_mask, G * (1.0 - self.ir_drop_beta), G)
         
@@ -592,7 +602,7 @@ class MemristorDeviceModel:
         self,
         x: torch.Tensor,
         bits: Optional[int] = None,
-        add_noise: bool = False,
+        add_noise: Optional[bool] = None,
     ) -> torch.Tensor:
         """
         ADC量化函数。
@@ -606,7 +616,7 @@ class MemristorDeviceModel:
         Args:
             x: 输入张量
             bits: ADC位数（如果为None，使用self.adc_bits）
-            add_noise: 是否添加轻微的量化噪声
+            add_noise: 是否添加轻微的量化噪声（如果为None，使用self.adc_add_noise）
             
         Returns:
             x_quant: 量化后的张量
@@ -616,6 +626,10 @@ class MemristorDeviceModel:
         
         if bits is None:
             bits = self.adc_bits
+        
+        # 如果add_noise未指定，使用配置值
+        if add_noise is None:
+            add_noise = self.adc_add_noise
         
         device = x.device
         dtype = x.dtype
@@ -645,6 +659,84 @@ class MemristorDeviceModel:
             x_quant = x_quant + noise
         
         return x_quant
+    
+    def apply_crossbar_ir_drop(
+        self,
+        x_tile: torch.Tensor,
+        W_tile: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        应用crossbar模式的IR-drop。
+        
+        对一个tile（n列），计算每列的衰减系数并应用到输入上。
+        
+        公式：
+        - 活动强度：s_j = sum_i |G_{ij}|
+        - 位置因子：p_j = (j/n)^eta, j=1...n
+        - 列衰减：alpha_j = clamp(1 - beta * p_j * (s_j / (norm(s) + eps)), 0, 1)
+        - 输入衰减：x'_j = alpha_j * x_j
+        
+        Args:
+            x_tile: 输入张量 [batch, tile_in] 或 [batch, ..., tile_in]
+            W_tile: 权重矩阵 [tile_out, tile_in]
+            
+        Returns:
+            x_tile_ir: 应用IR-drop后的输入张量，形状与x_tile相同
+        """
+        if self.ir_drop_mode != 'crossbar' or self.ir_drop_beta <= 0:
+            return x_tile
+        
+        device = x_tile.device
+        dtype = x_tile.dtype
+        
+        # 保存原始形状
+        orig_shape = x_tile.shape
+        if x_tile.dim() > 2:
+            # 将除最后一个维度外的所有维度展平
+            x_tile = x_tile.reshape(-1, x_tile.shape[-1])  # [batch*..., tile_in]
+        
+        batch_size, n = x_tile.shape  # n是列数（tile_in）
+        tile_out = W_tile.shape[0]
+        
+        # 1. 将权重矩阵映射到电导值（只使用正电导部分，因为活动强度是绝对值）
+        # 使用adaptive mapping获取电导值
+        G_pos, G_neg, max_abs = self.map_weights_to_conductance_diff_adaptive(W_tile)
+        # 使用G_pos作为活动强度的基础（也可以使用|G_pos - G_neg|，这里用G_pos简化）
+        G_abs = torch.abs(G_pos - G_neg)  # [tile_out, tile_in]
+        
+        # 2. 计算每列的活动强度：s_j = sum_i |G_{ij}|
+        s_j = torch.sum(G_abs, dim=0)  # [tile_in]
+        
+        # 3. 计算位置因子：p_j = (j/n)^eta, j=1...n
+        j_indices = torch.arange(1, n + 1, device=device, dtype=dtype)  # [n], j从1到n
+        p_j = torch.pow(j_indices / n, self.ir_drop_eta)  # [n]
+        
+        # 4. 计算归一化因子
+        eps = 1e-12
+        if self.ir_drop_norm == 'mean':
+            s_norm = torch.mean(s_j) + eps
+        elif self.ir_drop_norm == 'max':
+            s_norm = torch.max(s_j) + eps
+        else:
+            raise ValueError(f"Unknown ir_drop_norm: {self.ir_drop_norm}. Use 'mean' or 'max'.")
+        
+        # 5. 计算列衰减系数：alpha_j = clamp(1 - beta * p_j * (s_j / s_norm), 0, 1)
+        # 限制衰减不超过ir_drop_cap
+        attenuation = self.ir_drop_beta * p_j * (s_j / s_norm)  # [n]
+        attenuation = torch.clamp(attenuation, min=0.0, max=self.ir_drop_cap)
+        alpha_j = 1.0 - attenuation  # [n]
+        alpha_j = torch.clamp(alpha_j, min=0.0, max=1.0)
+        
+        # 6. 应用衰减到输入：x'_j = alpha_j * x_j
+        # alpha_j需要broadcast到batch维度
+        alpha_j = alpha_j.unsqueeze(0)  # [1, n]
+        x_tile_ir = x_tile * alpha_j  # [batch, n]
+        
+        # 恢复原始形状
+        if len(orig_shape) > 2:
+            x_tile_ir = x_tile_ir.reshape(orig_shape)
+        
+        return x_tile_ir
     
     def matmul_with_tiling(
         self,
@@ -698,6 +790,10 @@ class MemristorDeviceModel:
 
                 assert W_tile.shape[1] == x_tile.shape[1], \
                     f"Tile mismatch: W_tile={W_tile.shape}, x_tile={x_tile.shape}"
+                
+                # 应用crossbar IR-drop（在矩阵乘法之前）
+                if self.ir_drop_mode == 'crossbar':
+                    x_tile = self.apply_crossbar_ir_drop(x_tile, W_tile)
                 
                 # 矩阵乘法
                 y_partial = torch.matmul(x_tile, W_tile.T)  # [batch, tile_out]
@@ -770,6 +866,7 @@ class MemristorDeviceModel:
             'adc_bits': self.adc_bits,
             'enable_update_model': self.enable_update_model,
             'enable_adc': self.enable_adc,
+            'adc_add_noise': self.adc_add_noise,
             'enable_energy': self.enable_energy,
             'update_params': self.update_params,
             'energy_coefs': self.energy_coefs,
@@ -779,6 +876,9 @@ class MemristorDeviceModel:
             'ir_drop_mode': self.ir_drop_mode,
             'ir_drop_gamma': self.ir_drop_gamma,
             'ir_drop_scaling': self.ir_drop_scaling,
+            'ir_drop_eta': self.ir_drop_eta,
+            'ir_drop_cap': self.ir_drop_cap,
+            'ir_drop_norm': self.ir_drop_norm,
         }
         torch.save(state, path)
     
@@ -806,6 +906,7 @@ class MemristorDeviceModel:
         self.adc_bits = state.get('adc_bits', 6)
         self.enable_update_model = state.get('enable_update_model', False)
         self.enable_adc = state.get('enable_adc', False)
+        self.adc_add_noise = state.get('adc_add_noise', False)
         self.enable_energy = state.get('enable_energy', False)
         self.update_params = state.get('update_params', {
             'A_plus': 1e-5, 'A_minus': 1e-5, 'p_plus': 1.0, 'p_minus': 1.0,
@@ -822,5 +923,8 @@ class MemristorDeviceModel:
         self.ir_drop_mode = state.get('ir_drop_mode', 'none')
         self.ir_drop_gamma = state.get('ir_drop_gamma', 0.35)
         self.ir_drop_scaling = state.get('ir_drop_scaling', 1.0)
+        self.ir_drop_eta = state.get('ir_drop_eta', 1.0)
+        self.ir_drop_cap = state.get('ir_drop_cap', 0.10)
+        self.ir_drop_norm = state.get('ir_drop_norm', 'mean')
 
 

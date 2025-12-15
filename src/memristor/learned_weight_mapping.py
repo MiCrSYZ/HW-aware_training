@@ -178,6 +178,7 @@ def hardware_linear_forward_with_weight_mapping(
     
     # --- STEP 4: Forward pass using hardware_linear_forward_adaptive (same as HAT) ---
     # Use the same forward function as HAT
+    # Note: training flag is passed to hardware_linear_forward_adaptive, which will disable ADC quant during training
     out, debug_info = hardware_linear_forward_adaptive(
         x, W_pre, device_model, t=t, seed=seed, training=True
     )
@@ -317,8 +318,9 @@ class MemristorConv2d(nn.Module):
             out = out + self.bias_param.view(1, -1, 1, 1)
         
         # Apply ADC quantization on the final feature map (if enabled)
+        # Only apply during inference (not during training) to preserve gradients
         # All patches computed → fold back → feature map → one final ADC quant
-        if hasattr(self.device_model, 'enable_adc') and self.device_model.enable_adc:
+        if hasattr(self.device_model, 'enable_adc') and self.device_model.enable_adc and not self.training:
             out = self.device_model.adc_quant(out, bits=self.device_model.adc_bits)
 
         return out

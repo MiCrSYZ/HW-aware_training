@@ -35,19 +35,24 @@ memristor:
   drift_alpha: 1e-4
   stuck_ratio: 0.1
   stuck_low_prob: 0.5
-  ir_drop_beta: 0.0
   mapping: linear
-  # 新的IR-drop模型参数
-  ir_drop_mode: none  # options: none | simple | paper
+  ir_drop_mode: none  # options: none | simple | paper | crossbar
+  ir_drop_beta: 0.01
+  # paper版IR-drop模型参数
   ir_drop_gamma: 0.35  # 导线电阻缩放因子
   ir_drop_scaling: 1.0  # IR-drop校正项的最终缩放因子
+  # crossbar模式参数
+  ir_drop_eta: 1.0  # 位置因子幂次（crossbar模式）
+  ir_drop_cap: 0.10  # 单列最大衰减上限（crossbar模式）
+  ir_drop_norm: mean  # 列活动归一化方式（crossbar模式）：'mean' 或 'max'
   # 电导漂移时间设置方式
   drift_time_mode: accumulate  # 'fixed' 或 'accumulate'：固定值或模拟真实器件老化（t随推理次数累加）
   drift_time_fixed: 0  # 固定值模式下的t值（仅在drift_time_mode='fixed'时生效）
   # 阵列规模和功能开关
   array_size: 128  # 忆阻器阵列规模（tile大小）
   adc_bits: 8  # ADC量化位数
-  enable_adc: false  # 启用ADC量化
+  enable_adc: true  # 启用ADC量化
+  adc_add_noise: false  # ADC量化是否添加噪声
   enable_energy: false  # 启用能耗估计
   enable_update_model: true # 启用状态依赖写入模型
   write:
@@ -73,20 +78,20 @@ memristor:
 experiment:
   mode: memristor_with_comp
   compensation_method: learned_mapping
-  mapping_lr: 3e-4
-  mapping_epochs_per_main_epoch: 1
+  mapping_lr: 3e-4  # post_train = true 时这玩意没用
+  mapping_epochs_per_main_epoch: 1  # post_train = true 时这玩意没用
   # Learned mapping parameters
   mapping_alpha: 0.5  # Alpha parameter for mapping_net delta scaling (scale = alpha * W_noisy.std())
-  mapping_max_frac: 0.5  # Max fraction for delta clamping (delta clamped to max_frac * |W_noisy|)
+  mapping_max_frac: 1.0  # Max fraction for delta clamping (delta clamped to max_frac * |W_noisy|)
   # Post-train learned mapping parameters
   post_train:
-    enabled: true  # Set to true to use post-train strategy
-    num_epochs: 20
-    lr: 3e-4  #post_train = true 之后mapping net的lr是这个
+    enabled: true  # Set to true to use post-train strategy（强烈建议开启，除非你想看loss炸成烟花）
+    num_epochs: 40
+    lr: 3e-4  # post_train = true 时mapping net的lr是这个
     lambda_reg: 1e-4  # Regularization weight for ||Δ||^2
   # Joint HAT + mapping_net parameters
   joint_hat:
-    enabled: false  # Set to true to use joint training strategy
+    enabled: false  # Set to true to use joint training strategy（强烈建议关闭，除非你想看loss炸成烟花）
     beta: 0.5  # Weight for hw_mse loss (MSE between float and hardware outputs)
     gamma: 1e-5  # Weight for regularization ||Δ||_2^2
   # Boundary regularization parameters

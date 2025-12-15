@@ -55,7 +55,8 @@ def hardware_linear_forward_adaptive(
         out = F.linear(x, W_eff)
 
     # Final ADC quantization AFTER tile-sum
-    if hasattr(device_model, "enable_adc") and device_model.enable_adc:
+    # Only apply ADC quantization during inference (not during training) to preserve gradients
+    if hasattr(device_model, "enable_adc") and device_model.enable_adc and not training:
         out = device_model.adc_quant(out, bits=device_model.adc_bits)
 
     # Apply new IR-drop correction based on paper equations (16)-(18) if enabled
