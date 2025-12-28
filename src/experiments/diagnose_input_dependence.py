@@ -932,21 +932,21 @@ def main():
         print("INTERPRETATION")
         print("="*60)
         if results['error_variance'] > 1e-4:
-            print("⚠ High error variance → Strong input dependence")
+            print(" High error variance → Strong input dependence")
         else:
-            print("✓ Low error variance → Weak input dependence")
+            print(" Low error variance → Weak input dependence")
         
         if results['mean_correlation'] < 0.5:
-            print("⚠ Low correlation → Error structure changes with input")
+            print(" Low correlation → Error structure changes with input")
         else:
-            print("✓ High correlation → Error structure is consistent")
+            print(" High correlation → Error structure is consistent")
         
         avg_residual_ratio = np.mean(results['static_deltaW_residual_ratios'][1:])
         if avg_residual_ratio > 0.5:
-            print("⚠ High residual ratio → Static ΔW does NOT transfer well")
+            print(" High residual ratio → Static ΔW does NOT transfer well")
             print("  → Input-dependent calibration may be needed")
         else:
-            print("✓ Low residual ratio → Static ΔW transfers well")
+            print(" Low residual ratio → Static ΔW transfers well")
             print("  → Static weight-only mapping may be sufficient")
         
         # Visualize
