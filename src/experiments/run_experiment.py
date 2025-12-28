@@ -143,6 +143,24 @@ def run_experiment(
         from ..data.dataset import get_dataloaders
     except ImportError:
         from src.data.dataset import get_dataloaders
+    
+    # Determine input channels and num_classes based on dataset BEFORE loading data
+    dataset_name = config['dataset'].lower()
+    if dataset_name == 'mnist':
+        in_channels = 1  # Grayscale
+        num_classes = config.get('num_classes', 10)
+    elif dataset_name == 'cifar10':
+        in_channels = 3  # RGB
+        num_classes = config.get('num_classes', 10)
+    elif dataset_name == 'cifar100':
+        in_channels = 3  # RGB
+        num_classes = config.get('num_classes', 100)
+    else:
+        in_channels = config.get('in_channels', 3)  # Default to RGB
+        num_classes = config.get('num_classes', 10)  # Default to 10
+    
+    experiment_logger.info(f"Dataset: {dataset_name}, num_classes: {num_classes}, in_channels: {in_channels}")
+    
     train_loader, val_loader, test_loader = get_dataloaders(
         dataset_name=config['dataset'],
         data_root=config['data_root'],
@@ -152,19 +170,40 @@ def run_experiment(
         seed=config.get('seed'),
     )
     
+    # Validate label ranges in the dataset
+    # This helps catch configuration errors early
+    experiment_logger.info("Validating dataset labels...")
+    max_label = -1
+    min_label = float('inf')
+    sample_count = 0
+    
+    # Check a few batches from train_loader
+    for batch_idx, (data, target) in enumerate(train_loader):
+        if batch_idx >= 5:  # Check first 5 batches
+            break
+        batch_max = target.max().item()
+        batch_min = target.min().item()
+        max_label = max(max_label, batch_max)
+        min_label = min(min_label, batch_min)
+        sample_count += len(target)
+    
+    experiment_logger.info(f"Label range in dataset: [{min_label}, {max_label}], expected: [0, {num_classes-1}]")
+    
+    if max_label >= num_classes or min_label < 0:
+        error_msg = (
+            f"Label mismatch detected! Dataset labels range [{min_label}, {max_label}], "
+            f"but model expects [0, {num_classes-1}]. "
+            f"Please check your config: dataset={dataset_name}, num_classes={num_classes}. "
+            f"For CIFAR-100, num_classes should be 100. For CIFAR-10, num_classes should be 10."
+        )
+        experiment_logger.error(error_msg)
+        raise ValueError(error_msg)
+    
     # Model
-    # Determine input channels based on dataset
-    dataset_name = config['dataset'].lower()
-    if dataset_name == 'mnist':
-        in_channels = 1  # Grayscale
-    elif dataset_name == 'cifar10':
-        in_channels = 3  # RGB
-    else:
-        in_channels = config.get('in_channels', 3)  # Default to RGB
     
     base_model = get_model(
         name=config['model_name'],
-        num_classes=config.get('num_classes', 10),
+        num_classes=num_classes,
         in_channels=in_channels,
     )
     base_model = base_model.to(device)
@@ -230,6 +269,7 @@ def run_experiment(
         ir_drop_eta = memristor_config.get('ir_drop_eta', 1.0)
         ir_drop_cap = memristor_config.get('ir_drop_cap', 0.10)
         ir_drop_norm = memristor_config.get('ir_drop_norm', 'mean')
+        ir_drop_train_enabled = memristor_config.get('ir_drop_train_enabled', True)  # 默认True保持向后兼容
         
         # 读取写入更新参数
         write_config = memristor_config.get('write', {})
@@ -271,6 +311,7 @@ def run_experiment(
             ir_drop_eta=float(ir_drop_eta),
             ir_drop_cap=float(ir_drop_cap),
             ir_drop_norm=str(ir_drop_norm),
+            ir_drop_train_enabled=bool(ir_drop_train_enabled),
         )
         
         # Check if learned mapping is used
@@ -587,11 +628,41 @@ def run_experiment(
         post_train_num_epochs = int(post_train_config.get('num_epochs', 20))
         post_train_lr = float(post_train_config.get('lr', 3e-4))
         post_train_lambda_reg = float(post_train_config.get('lambda_reg', 1e-4))
+        post_train_lambda_scale = float(post_train_config.get('lambda_scale', 1e-3))
+        post_train_mode = post_train_config.get('mode', 'additive_only')  # Default to original additive mode
         enable_sanity_check = config['experiment'].get('enable_sanity_check', False)
         
         experiment_logger.info(f"Post-train parameters: epochs={post_train_num_epochs}, "
-                              f"lr={post_train_lr}, lambda_reg={post_train_lambda_reg}")
+                              f"lr={post_train_lr}, lambda_reg={post_train_lambda_reg}, "
+                              f"lambda_scale={post_train_lambda_scale}, mode={post_train_mode}")
+        # Use random t for each batch to improve robustness to drift
+        post_train_use_random_t = post_train_config.get('use_random_t', True)  # Default to True
+        post_train_t_max = post_train_config.get('t_max', 1000)  # Default max t value
+        # Fixed t value for mapping_net training and evaluation (used when use_random_t=False)
+        post_train_t_fixed = post_train_config.get('t_fixed', 0)  # Default to 0
+        # t_eval: explicit evaluation t value (can be set independently of training t)
+        post_train_t_eval = post_train_config.get('t_eval', None)
+        experiment_logger.info(f"Post-train drift time: use_random_t={post_train_use_random_t}, "
+                              f"t_max={post_train_t_max if post_train_use_random_t else 'N/A'}, "
+                              f"t_fixed={post_train_t_fixed if not post_train_use_random_t else 'N/A'}, "
+                              f"t_eval={post_train_t_eval if post_train_t_eval is not None else 'auto'}")
         experiment_logger.info("Starting post-train mapping_net training:")
+        
+        # Store t value for evaluation
+        # If t_eval is not set, use t_fixed when use_random_t=False, or 0 when use_random_t=True
+        if post_train_t_eval is not None:
+            run_experiment._post_train_t_fixed = post_train_t_eval
+        elif not post_train_use_random_t:
+            run_experiment._post_train_t_fixed = post_train_t_fixed
+        else:
+            run_experiment._post_train_t_fixed = 0  # Default to 0 when use_random_t=True
+        
+        # Temporarily switch drift_time_mode to 'param' for mapping_net training
+        # This allows use_random_t and t_fixed to take effect, while keeping
+        # the original drift_time_mode for HAT training (stage 1)
+        original_drift_time_mode = device_model.drift_time_mode
+        device_model.drift_time_mode = 'param'
+        experiment_logger.info(f"Temporarily switched drift_time_mode from '{original_drift_time_mode}' to 'param' for mapping_net training")
         
         # Train mapping_net while freezing main model
         # train_weight_mapping will log each epoch internally
@@ -605,20 +676,31 @@ def run_experiment(
             num_epochs=post_train_num_epochs,
             lr=post_train_lr,
             lambda_reg=post_train_lambda_reg,
-            t=0,  # Use t=0 for post-train
+            lambda_scale=post_train_lambda_scale,
+            t=post_train_t_fixed,  # Fixed t value (used if use_random_t=False)
+            use_random_t=post_train_use_random_t,
+            t_max=post_train_t_max,
             enable_sanity_check=enable_sanity_check,
+            mode=post_train_mode,
         )
+        
+        # Restore original drift_time_mode after mapping_net training
+        device_model.drift_time_mode = original_drift_time_mode
+        experiment_logger.info(f"Restored drift_time_mode to '{original_drift_time_mode}'")
         
         experiment_logger.info(f"Post-train mapping_net training completed. "
                               f"Best: val_acc={mapping_results.get('best_val_acc', 0.0):.2f}%, "
                               f"loss={mapping_results.get('best_loss', 0.0):.4f}")
         
-        # Compute W_final = W_fp + ΔW for learned mapping
+        # Compute W_final based on mode
         # Flow: Main network training (same as HAT) → W_fp → Mapping network training (no write_update) 
-        # → W_final = W_fp + ΔW → write_update → inference
+        # → W_final (depends on mode) → write_update → inference
         # W_fp is the trained main model weights (already in model, adapted to non-idealities via HAT)
         # ΔW is computed by mapping_net from W_fp (mapping_net takes W_fp as input, not W_noisy)
-        experiment_logger.info("Computing W_final = W_fp + ΔW for all layers...")
+        if post_train_mode == "additive_only":
+            experiment_logger.info("Computing W_final = W_fp + ΔW for all layers (additive_only mode)...")
+        else:
+            experiment_logger.info("Computing W_final = scale * W_fp + ΔW for all layers...")
         mapping_net.eval()
         with torch.no_grad():
             for module in target_model.modules():
@@ -667,8 +749,17 @@ def run_experiment(
                 abs_clip = (device_model.wmax - device_model.wmin) * 0.5
                 delta_W = torch.clamp(delta_W, -abs_clip, abs_clip)
                 
-                # Compute W_final = W_fp + ΔW
-                W_final = W_fp + delta_W
+                # Compute W_final based on mode
+                if post_train_mode == "additive_only":
+                    # Original additive-only mode: W_final = W_fp + ΔW
+                    W_final = W_fp + delta_W
+                else:
+                    # Multiplicative + additive mode: W_final = scale * W_fp + ΔW
+                    # Apply multiplicative calibration: W_scaled = scale * W_fp
+                    scale = mapping_net.scale if hasattr(mapping_net, 'scale') else torch.tensor(1.0, device=W_fp.device)
+                    W_scaled = scale * W_fp
+                    # Then add additive correction: W_final = W_scaled + delta_W
+                    W_final = W_scaled + delta_W
                 
                 # Clamp to allowed weight range
                 W_final = torch.clamp(W_final, device_model.wmin, device_model.wmax)
@@ -676,7 +767,13 @@ def run_experiment(
                 # Update module weight to W_final
                 module.weight.data.copy_(W_final)
         
-        experiment_logger.info("W_final = W_fp + ΔW computed and stored in model weights")
+        # Log scale value (if applicable)
+        if hasattr(mapping_net, 'scale') and post_train_mode != "additive_only":
+            experiment_logger.info(f"learned scale: {mapping_net.scale.item():.6f}")
+        if post_train_mode == "additive_only":
+            experiment_logger.info("W_final = W_fp + ΔW computed and stored in model weights")
+        else:
+            experiment_logger.info("W_final = scale * W_fp + ΔW computed and stored in model weights")
         
         # Write W_final to hardware using write_update (if enabled)
         # This simulates the hardware programming process after computing W_final
@@ -699,6 +796,8 @@ def run_experiment(
                 module.set_learned_mapping(None)
         
         # Re-validate with W_final (mapping_net disabled, using hardware weights)
+        # Use 'param' mode for evaluation to use the same t as mapping_net training
+        device_model.drift_time_mode = 'param'
         if val_loader is not None:
             val_metrics = _validate_memristor(
                 model, val_loader, criterion, device, device_model
@@ -759,6 +858,10 @@ def run_experiment(
     
     # Final evaluation on test set
     if test_loader:
+        # For learned_mapping with post_train, ensure drift_time_mode='param' for consistent t
+        if use_post_train and device_model is not None:
+            device_model.drift_time_mode = 'param'
+        
         if experiment_mode == 'baseline':
             test_metrics = _validate_baseline(model, test_loader, criterion, device)
         elif experiment_mode == 'memristor_no_comp':
@@ -851,6 +954,26 @@ def _train_baseline(
     
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
+        
+        # Validate labels before forward pass (only on first batch of first epoch to avoid overhead)
+        if epoch == 0 and batch_idx == 0:
+            max_label = target.max().item()
+            min_label = target.min().item()
+            # Get model output size
+            with torch.no_grad():
+                sample_output = model(data[:1])
+                model_output_size = sample_output.shape[1]
+            
+            if max_label >= model_output_size or min_label < 0:
+                error_msg = (
+                    f"Label mismatch in training batch! Labels range [{min_label}, {max_label}], "
+                    f"but model output size is {model_output_size}. "
+                    f"This will cause CUDA device-side assert error. "
+                    f"Please check your config: num_classes should match the dataset. "
+                    f"For CIFAR-100, num_classes must be 100. For CIFAR-10, num_classes must be 10."
+                )
+                logger.error(error_msg)
+                raise ValueError(error_msg)
         
         optimizer.zero_grad()
         output = model(data)
@@ -999,6 +1122,10 @@ def _train_learned_mapping(
         logger.info(f"Learned mapping training: enable_sanity_check={enable_sanity_check}, "
                     f"mapping_epochs={mapping_epochs}, lr={config['experiment'].get('mapping_lr', 1e-4)}")
         
+        # Get mapping mode and lambda_scale from config (with defaults)
+        mapping_mode = config['experiment'].get('mapping_mode', 'additive_only')
+        mapping_lambda_scale = float(config['experiment'].get('mapping_lambda_scale', 1e-3))
+        
         mapping_results = train_weight_mapping(
             mapping_net=mapping_net,
             model=model,
@@ -1009,8 +1136,10 @@ def _train_learned_mapping(
             num_epochs=mapping_epochs,
             lr=float(config['experiment'].get('mapping_lr', 1e-4)),
             lambda_reg=float(config['experiment'].get('mapping_lambda_reg', 1e-4)),
+            lambda_scale=mapping_lambda_scale,
             t=t_step,
             enable_sanity_check=enable_sanity_check,
+            mode=mapping_mode,
         )
         
         # Get training metrics with learned mapping applied
@@ -1452,9 +1581,14 @@ def _validate_memristor(
     criterion: nn.Module,
     device: torch.device,
     device_model: MemristorDeviceModel,
+    t: Optional[int] = None,
 ) -> Dict[str, float]:
     """
     Validation with memristor non-idealities applied.
+    
+    Args:
+        t: Drift time for evaluation. If None, uses t_fixed from post_train config
+           (stored in run_experiment._post_train_t_fixed), or 0 if not available.
     
     Note: Each forward pass will apply non-idealities with different random noise
     (unless seed is fixed). This simulates realistic memristor behavior where
@@ -1463,6 +1597,16 @@ def _validate_memristor(
     model.eval()
     losses = AverageMeter('Loss', ':.4f')
     top1 = AverageMeter('Acc@1', ':6.2f')
+    
+    # Determine t value for evaluation
+    # Priority: explicit t arg > post_train t_fixed > default 0
+    if t is None:
+        if hasattr(run_experiment, '_post_train_t_fixed') and run_experiment._post_train_t_fixed is not None:
+            eval_t = run_experiment._post_train_t_fixed
+        else:
+            eval_t = 0
+    else:
+        eval_t = t
     
     # 重置能耗统计（如果启用）
     if hasattr(device_model, 'enable_energy') and device_model.enable_energy:
@@ -1476,11 +1620,11 @@ def _validate_memristor(
         for batch_idx, (data, target) in enumerate(val_loader):
             data, target = data.to(device), target.to(device)
             
-            # Forward with non-idealities (use t=0 for evaluation)
-            # For memristor-wrapped models, always pass t parameter
+            # Forward with non-idealities
+            # Use eval_t which matches mapping_net training t (when use_random_t=False)
             # Don't use seed here to allow natural randomness in non-idealities
             try:
-                output = model(data, t=0, seed=None)
+                output = model(data, t=eval_t, seed=None)
             except TypeError:
                 # Fallback if model doesn't accept t parameter
                 output = model(data)

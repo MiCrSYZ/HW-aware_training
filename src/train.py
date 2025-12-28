@@ -50,10 +50,20 @@ def main(args=None):
     if args.output_dir:
         output_dir = args.output_dir
     else:
-        experiment_name = config.get('experiment_name', 'experiment')
+        dataset_name = config.get('dataset', 'cifar10').lower()
         seed = config.get('seed', 42)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_dir = os.path.join('outputs', experiment_name, f'seed_{seed}', timestamp)
+        
+        # For CIFAR-100, use special directory structure: ./output/CIFAR-100/config_name/seed/id
+        if dataset_name == 'cifar100':
+            # Get config name from file path (without extension)
+            config_path = args.config
+            config_name = os.path.splitext(os.path.basename(config_path))[0]
+            output_dir = os.path.join('output', 'CIFAR-100', config_name, f'seed_{seed}', timestamp)
+        else:
+            # For other datasets, use original structure
+            experiment_name = config.get('experiment_name', 'experiment')
+            output_dir = os.path.join('outputs', experiment_name, f'seed_{seed}', timestamp)
     
     os.makedirs(output_dir, exist_ok=True)
     

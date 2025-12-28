@@ -130,6 +130,7 @@ def main(args=None):
         ir_drop_eta = memristor_config.get('ir_drop_eta', 1.0)
         ir_drop_cap = memristor_config.get('ir_drop_cap', 0.10)
         ir_drop_norm = memristor_config.get('ir_drop_norm', 'mean')
+        ir_drop_train_enabled = memristor_config.get('ir_drop_train_enabled', True)  # 默认True保持向后兼容
         
         device_model = MemristorDeviceModel(
             G_min=float(memristor_config['G_min']),
@@ -161,6 +162,7 @@ def main(args=None):
             ir_drop_eta=float(ir_drop_eta),
             ir_drop_cap=float(ir_drop_cap),
             ir_drop_norm=str(ir_drop_norm),
+            ir_drop_train_enabled=bool(ir_drop_train_enabled),
         )
         model = wrap_model_with_memristor(model, device_model)
     

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, Any
 import logging
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,13 @@ class WeightMappingNet(nn.Module):
         super().__init__()
         self.per_group = per_group
         self.alpha = alpha  # multiplicative scale applied to network output (learnable via hyper)
+
+        # Learnable per-layer scalar for multiplicative calibration
+        # W_final = scale * W_fp + delta_W
+        self.scale = nn.Parameter(torch.ones(1))
+        # Flag to indicate whether to use multiplicative scale (set during training)
+        # Default to False (additive_only mode)
+        self._use_multiplicative_scale = False
 
         # shared per-element MLP (input is scalar noisy weight value)
         # we use a tiny MLP applied to each element (via flatten/reshape) for efficiency
@@ -158,8 +166,19 @@ def hardware_linear_forward_with_weight_mapping(
         debug['delta_max_abs'] = float(delta_W.abs().max().detach().cpu().item())
         debug['noise_scale'] = noise_scale
     
-    # --- STEP 2: Compute W_pre = W_fp + delta_W ---
-    W_pre = W_fp + delta_W
+    # --- STEP 2: Compute W_pre ---
+    # Check if scale should be used
+    # In additive_only mode, _use_multiplicative_scale is False
+    # In scale_only and scale_plus_delta modes, _use_multiplicative_scale is True
+    use_scale = getattr(mapping_net, '_use_multiplicative_scale', False) and hasattr(mapping_net, 'scale')
+    
+    if use_scale:
+        # Use multiplicative + additive calibration: W_pre = scale * W_fp + delta_W
+        W_scaled = mapping_net.scale * W_fp
+        W_pre = W_scaled + delta_W
+    else:
+        # Original additive-only mode: W_pre = W_fp + delta_W
+        W_pre = W_fp + delta_W
     
     # --- STEP 3: Clamp W_pre to allowed range ---
     if hasattr(device_model, 'wmin') and hasattr(device_model, 'wmax'):
@@ -168,6 +187,8 @@ def hardware_linear_forward_with_weight_mapping(
     with torch.no_grad():
         debug['W_fp_mean'] = float(W_fp.mean().detach().cpu().item())
         debug['W_pre_mean'] = float(W_pre.mean().detach().cpu().item())
+        # Only log scale if it's being used (requires_grad=True)
+        debug['scale'] = float(mapping_net.scale.item()) if use_scale else None
     
     # Check for NaN/Inf
     if torch.isnan(W_pre).any() or torch.isinf(W_pre).any():
@@ -195,7 +216,8 @@ def hardware_linear_forward_with_weight_mapping(
         print(f"W_fp mean: {debug['W_fp_mean']:.6e}")
         print(f"W_pre mean: {debug['W_pre_mean']:.6e}")
         if debug['delta_mean'] is not None:
-            print(f"delta mean: {debug['delta_mean']:.6e}, delta_max_abs: {debug['delta_max_abs']:.6e}, noise_scale: {debug['noise_scale']:.6e}")
+            scale_str = f", scale: {debug['scale']:.6e}" if debug.get('scale') is not None else ""
+            print(f"delta mean: {debug['delta_mean']:.6e}, delta_max_abs: {debug['delta_max_abs']:.6e}, noise_scale: {debug['noise_scale']:.6e}{scale_str}")
         else:
             print("mapping_net is None (no correction applied).")
         print("=" * 30 + "\n", flush=True)
@@ -337,20 +359,59 @@ def train_weight_mapping(
         num_epochs: int = 10,
         lr: float = 1e-4,
         lambda_reg: float = 1e-4,
+        lambda_scale: float = 1e-3,
         t: int = 0,
+        use_random_t: bool = False,
+        t_max: int = 1000,
         enable_sanity_check: bool = False,
+        mode: str = "additive_only",
 ) -> Dict[str, Any]:
     """
     Post-train mapping_net while freezing the main model weights.
     Mapping net learns ΔW in weight space; model is frozen.
+    
+    Args:
+        use_random_t: If True, use random t for each batch instead of fixed t
+        t_max: Maximum t value when use_random_t=True (t will be randomly sampled from [0, t_max])
+        mode: Training mode - "additive_only" (original: W_fp + ΔW, no scale, default), 
+              "scale_only" (only train scale, freeze delta_W), or "scale_plus_delta" (train both)
+        lambda_scale: Regularization weight for scale term: L_scale = lambda_scale * (scale - 1.0)^2
     """
     # Freeze main model
     for p in model.parameters():
         p.requires_grad = False
 
-    # Ensure mapping_net parameters require gradients
-    for p in mapping_net.parameters():
-        p.requires_grad = True
+    # Set up parameter training based on mode
+    if mode == "additive_only":
+        # Original mode: W_final = W_fp + ΔW (no scale)
+        # Freeze scale if it exists, train only delta_W
+        for name, p in mapping_net.named_parameters():
+            if 'scale' in name:
+                p.requires_grad = False
+            elif 'elem_mlp' in name:
+                p.requires_grad = True
+        # Mark that we don't use multiplicative scale
+        mapping_net._use_multiplicative_scale = False
+        logger.info("train_weight_mapping: mode=additive_only, using original additive mode (W_fp + ΔW), freezing scale")
+    elif mode == "scale_only":
+        # Freeze all delta_W-related parameters (elem_mlp)
+        for name, p in mapping_net.named_parameters():
+            if 'elem_mlp' in name:
+                p.requires_grad = False
+            elif 'scale' in name:
+                p.requires_grad = True
+        # Mark that we use multiplicative scale
+        mapping_net._use_multiplicative_scale = True
+        logger.info("train_weight_mapping: mode=scale_only, freezing delta_W parameters, training only scale")
+    elif mode == "scale_plus_delta":
+        # Train both scale and delta_W
+        for p in mapping_net.parameters():
+            p.requires_grad = True
+        # Mark that we use multiplicative scale
+        mapping_net._use_multiplicative_scale = True
+        logger.info("train_weight_mapping: mode=scale_plus_delta, training both scale and delta_W")
+    else:
+        raise ValueError(f"Unknown mode: {mode}. Must be 'additive_only', 'scale_only', or 'scale_plus_delta'")
 
     # Set mapping net for layers
     # If model is a MemristorModel wrapper, we need to access base_model
@@ -413,7 +474,9 @@ def train_weight_mapping(
 
     mapping_net.train()
 
-    opt = torch.optim.Adam(mapping_net.parameters(), lr=lr, weight_decay=0.0)
+    # Only optimize parameters that require gradients
+    trainable_params = [p for p in mapping_net.parameters() if p.requires_grad]
+    opt = torch.optim.Adam(trainable_params, lr=lr, weight_decay=0.0)
 
     best_acc = 0.0
     best_loss = float('inf')
@@ -459,18 +522,35 @@ def train_weight_mapping(
                 print("=" * 60 + "\n")
 
             # Forward through frozen model (mapping_net applied inside layers)
+            # Use random t for each batch if enabled
+            if use_random_t:
+                batch_t = random.randint(0, t_max)
+            else:
+                batch_t = t
+            
             # Pass enable_sanity_check to model forward
             try:
-                out = model(data, t=t, enable_sanity_check=enable_sanity_check and batch_idx == 0)
+                out = model(data, t=batch_t, enable_sanity_check=enable_sanity_check and batch_idx == 0)
             except TypeError:
                 # Fallback if model doesn't support enable_sanity_check
-                out = model(data, t=t)
+                out = model(data, t=batch_t)
 
             loss_task = criterion(out, target)
 
-            # reg on mapping params to keep Δ small
-            reg = sum(p.pow(2).sum() for p in mapping_net.parameters())
-            loss = loss_task + lambda_reg * reg
+            # reg on mapping params to keep Δ small (only for elem_mlp parameters)
+            reg = torch.tensor(0.0, device=loss_task.device)
+            for name, p in mapping_net.named_parameters():
+                if 'elem_mlp' in name and p.requires_grad:
+                    reg = reg + p.pow(2).sum()
+            
+            # Scale regularization: L_scale = lambda_scale * (scale - 1.0)^2
+            # Only apply if scale exists and is being trained
+            if hasattr(mapping_net, 'scale') and mapping_net.scale.requires_grad:
+                scale_reg = lambda_scale * (mapping_net.scale - 1.0).pow(2)
+            else:
+                scale_reg = torch.tensor(0.0, device=loss_task.device)
+            
+            loss = loss_task + lambda_reg * reg + scale_reg
 
             # Check if loss requires grad before backward
             if not loss.requires_grad:
@@ -483,7 +563,8 @@ def train_weight_mapping(
                 raise RuntimeError("Loss does not require grad. Check gradient flow from mapping_net to output.")
 
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(mapping_net.parameters(), max_norm=1.0)
+            # Only clip gradients for trainable parameters
+            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             opt.step()
 
             epoch_loss += loss_task.item() * data.size(0)
@@ -519,7 +600,14 @@ def train_weight_mapping(
         if avg_loss < best_loss:
             best_loss = avg_loss
 
-        logger.info(f"Post-train mapping epoch {epoch + 1}/{num_epochs}: loss={avg_loss:.4f}, acc={acc:.2f}%")
+        # Log scale value with epoch ID
+        scale_value = mapping_net.scale.item() if hasattr(mapping_net, 'scale') else None
+        scale_str = f", learned scale: {scale_value:.6f}" if scale_value is not None else ""
+        logger.info(f"Post-train mapping epoch {epoch + 1}/{num_epochs}: loss={avg_loss:.4f}, acc={acc:.2f}%{scale_str}")
+        
+        # Print scale value with epoch ID as requested
+        if hasattr(mapping_net, 'scale'):
+            print(f"Epoch {epoch + 1}/{num_epochs} - learned scale: {mapping_net.scale.item():.6f}, loss: {avg_loss:.4f}, acc: {acc:.2f}%", flush=True)
 
     # Unfreeze main model after training mapping_net
     # This allows the main model to be trained in the outer training loop

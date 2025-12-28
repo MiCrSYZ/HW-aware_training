@@ -48,7 +48,8 @@ def hardware_linear_forward_adaptive(
         analog_out = device_model.matmul_with_tiling(
             x, W_eff,
             adc_bits=None,
-            per_tile_quant=False  # always false: quant happens after tile-sum
+            per_tile_quant=False,  # always false: quant happens after tile-sum
+            training=training
         )
         out = analog_out
     else:

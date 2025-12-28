@@ -75,6 +75,7 @@ class MemristorDeviceModel:
         ir_drop_eta: float = 1.0,  # 位置因子幂次（crossbar模式）
         ir_drop_cap: float = 0.10,  # 单列最大衰减上限（crossbar模式）
         ir_drop_norm: str = 'mean',  # 列活动归一化方式（crossbar模式）：'mean' 或 'max'
+        ir_drop_train_enabled: bool = True,  # crossbar模式下是否在训练时注入IR-drop（True=训练和推理都注入，False=仅推理时注入）
     ):
         self.G_min = G_min
         self.G_max = G_max
@@ -136,6 +137,7 @@ class MemristorDeviceModel:
         self.ir_drop_eta = ir_drop_eta
         self.ir_drop_cap = ir_drop_cap
         self.ir_drop_norm = ir_drop_norm
+        self.ir_drop_train_enabled = ir_drop_train_enabled
         
         # 存储 seed 用于生成固定的 stuck mask
         self.seed = seed
@@ -234,8 +236,7 @@ class MemristorDeviceModel:
 
     def _get_stuck_mask(self, shape: torch.Size, device: torch.device, dtype: torch.dtype) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        获取固定的 stuck mask（基于 seed）。
-        
+        获取 stuck mask（基于 seed）。
         如果 shape 改变，会重新生成；否则复用已生成的 mask。
         
         Args:
@@ -260,7 +261,7 @@ class MemristorDeviceModel:
                 stuck_rand = torch.rand(shape, generator=generator, device=device, dtype=dtype, requires_grad=False)
                 mask_rand = torch.rand(shape, generator=generator, device=device, dtype=dtype, requires_grad=False)
             else:
-                # 如果没有 seed，使用随机（但每次调用都会重新生成）
+                # 如果没有 seed，使用随机（每次调用都会重新生成）
                 stuck_rand = torch.rand(shape, device=device, dtype=dtype, requires_grad=False)
                 mask_rand = torch.rand(shape, device=device, dtype=dtype, requires_grad=False)
             
@@ -311,7 +312,7 @@ class MemristorDeviceModel:
         else:
             generator = None
 
-        # 1. 首先应用固定值故障：单元固定在高/低阻值（基于固定的 seed）
+        # 1. 首先应用固定值故障：单元固定在高/低阻值
         # 这会在后续步骤中保护这些 cell 不被其他故障影响
         stuck_low_mask = None
         stuck_high_mask = None
@@ -357,6 +358,9 @@ class MemristorDeviceModel:
             elif self.drift_time_mode == 'accumulate':
                 # 累加模式：使用推理次数计数器（模拟真实器件老化）
                 drift_t = self.inference_count
+            elif self.drift_time_mode == 'param':
+                # 参数模式：使用传入的t值（用于learned_mapping等需要控制t的场景）
+                drift_t = t
             else:
                 # 默认：使用传入的t值（向后兼容）
                 drift_t = t
@@ -744,6 +748,7 @@ class MemristorDeviceModel:
         W: torch.Tensor,
         adc_bits: Optional[int] = None,
         per_tile_quant: bool = True,
+        training: bool = True,
     ) -> torch.Tensor:
         """
         带tiling的矩阵乘法。
@@ -792,8 +797,10 @@ class MemristorDeviceModel:
                     f"Tile mismatch: W_tile={W_tile.shape}, x_tile={x_tile.shape}"
                 
                 # 应用crossbar IR-drop（在矩阵乘法之前）
+                # 根据 ir_drop_train_enabled 和 training 状态决定是否应用
                 if self.ir_drop_mode == 'crossbar':
-                    x_tile = self.apply_crossbar_ir_drop(x_tile, W_tile)
+                    if self.ir_drop_train_enabled or not training:
+                        x_tile = self.apply_crossbar_ir_drop(x_tile, W_tile)
                 
                 # 矩阵乘法
                 y_partial = torch.matmul(x_tile, W_tile.T)  # [batch, tile_out]
@@ -879,6 +886,7 @@ class MemristorDeviceModel:
             'ir_drop_eta': self.ir_drop_eta,
             'ir_drop_cap': self.ir_drop_cap,
             'ir_drop_norm': self.ir_drop_norm,
+            'ir_drop_train_enabled': self.ir_drop_train_enabled,
         }
         torch.save(state, path)
     
@@ -926,5 +934,6 @@ class MemristorDeviceModel:
         self.ir_drop_eta = state.get('ir_drop_eta', 1.0)
         self.ir_drop_cap = state.get('ir_drop_cap', 0.10)
         self.ir_drop_norm = state.get('ir_drop_norm', 'mean')
+        self.ir_drop_train_enabled = state.get('ir_drop_train_enabled', True)  # 默认True保持向后兼容
 
 
