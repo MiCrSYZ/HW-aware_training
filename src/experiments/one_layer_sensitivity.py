@@ -171,11 +171,13 @@ def compute_layer_input_dependence(
             'static_deltaW_residual_ratio_mean': np.nan,
         }
     
-    # Sample inputs
+    # Sample inputs and targets
     inputs = []
+    targets_list = []
     count = 0
-    for data, _ in data_loader:
+    for data, target in data_loader:
         inputs.append(data[:batch_size].to(device))
+        targets_list.append(target[:batch_size].to(device))
         count += 1
         if count >= num_samples:
             break
@@ -185,38 +187,49 @@ def compute_layer_input_dependence(
             'error_variance': np.nan,
             'mean_correlation': np.nan,
             'static_deltaW_residual_ratio_mean': np.nan,
+            'loss_sensitivity_weighted_error': np.nan,
+            'loss_sensitivity_weighted_error_abs': np.nan,
         }
     
-    # Extract layer inputs using forward hook
+    # Extract layer inputs and outputs using forward hooks
     layer_inputs = []
-    hooks = []
+    layer_outputs_ideal = []
+    layer_outputs_hw = []
     
-    def hook_fn(module, input, output):
+    def hook_input_fn(module, input):
         if isinstance(input, tuple):
             layer_inputs.append(input[0].detach().clone())
         else:
             layer_inputs.append(input.detach().clone())
+    
+    def hook_output_fn(module, input, output):
+        # Capture layer output (ideal computation)
+        layer_outputs_ideal.append(output.detach().clone())
     
     # Get base model if wrapped
     base_model = model
     if hasattr(model, 'base_model'):
         base_model = model.base_model
     
-    # Register hook
-    hook = None
+    # Register hooks
+    hook_input = None
+    hook_output = None
     for name, module in base_model.named_modules():
         if name == layer_name:
-            hook = module.register_forward_hook(hook_fn)
+            hook_input = module.register_forward_pre_hook(hook_input_fn)
+            hook_output = module.register_forward_hook(hook_output_fn)
             break
     
-    if hook is None:
+    if hook_input is None or hook_output is None:
         return {
             'error_variance': np.nan,
             'mean_correlation': np.nan,
             'static_deltaW_residual_ratio_mean': np.nan,
+            'loss_sensitivity_weighted_error': np.nan,
+            'loss_sensitivity_weighted_error_abs': np.nan,
         }
     
-    # Run forward passes
+    # Run forward passes to get ideal outputs
     model.eval()
     with torch.no_grad():
         for inp in inputs:
@@ -225,7 +238,13 @@ def compute_layer_input_dependence(
             except TypeError:
                 _ = model(inp)
     
-    hook.remove()
+    # Also compute hardware outputs
+    # We need to run forward pass with hardware computation enabled
+    # For now, we'll compute h_hw from h_ideal + eps
+    # But first, let's get the ideal outputs
+    
+    hook_input.remove()
+    hook_output.remove()
     
     if not layer_inputs:
         return {
@@ -247,8 +266,15 @@ def compute_layer_input_dependence(
     
     x_processed = []
     eps_list = []
+    h_ideal_list = []
+    h_hw_list = []
     
-    for x_layer in layer_inputs:
+    for i, x_layer in enumerate(layer_inputs):
+        # Get ideal output for this sample
+        h_ideal = None
+        if i < len(layer_outputs_ideal):
+            h_ideal = layer_outputs_ideal[i]
+        
         if is_linear:
             # Flatten if needed
             if x_layer.dim() > 2:
@@ -258,6 +284,18 @@ def compute_layer_input_dependence(
             # Compute hardware error
             eps = hardware_error(x_layer, W, device_model, t=t, seed=None)
             eps_list.append(eps)
+            
+            # Get ideal and hardware outputs
+            if h_ideal is not None:
+                # Flatten if needed
+                if h_ideal.dim() > 2:
+                    h_ideal = h_ideal.view(h_ideal.size(0), -1)
+                # Ensure dimensions match
+                if h_ideal.shape[1] == eps.shape[1]:
+                    h_ideal_list.append(h_ideal)
+                    # Hardware output = ideal + error
+                    h_hw = h_ideal + eps
+                    h_hw_list.append(h_hw)
         
         elif is_conv:
             # For Conv2d, we need to unfold
@@ -304,22 +342,62 @@ def compute_layer_input_dependence(
             x_processed.append(x_flat)
             eps = hardware_error(x_flat, W_flat, device_model, t=t, seed=None)
             eps_list.append(eps)
+            
+            # For conv layers, reshape outputs to match eps dimensions
+            if h_ideal is not None:
+                h_ideal_flat = h_ideal.view(h_ideal.size(0), -1)
+                # Match dimensions with eps
+                if h_ideal_flat.shape[1] == eps.shape[1]:
+                    h_ideal_list.append(h_ideal_flat)
+                    h_hw = h_ideal_flat + eps
+                    h_hw_list.append(h_hw)
     
     if not eps_list:
         return {
             'error_variance': np.nan,
             'mean_correlation': np.nan,
             'static_deltaW_residual_ratio_mean': np.nan,
+            'loss_sensitivity_weighted_error': np.nan,
+            'loss_sensitivity_weighted_error_abs': np.nan,
         }
+    
+    # Prepare for loss-sensitivity computation
+    # Create criterion (CrossEntropyLoss)
+    criterion = nn.CrossEntropyLoss()
+    
+    # Ensure inputs_list and targets_list match the length of eps_list
+    # (Some samples may have been skipped for conv layers)
+    inputs_matched = inputs[:len(eps_list)]
+    targets_matched = targets_list[:len(eps_list)]
+    
+    # Ensure h_ideal_list and h_hw_list match eps_list length
+    # If they don't match, we can't compute loss-sensitivity
+    can_compute_sensitivity = (
+        len(h_ideal_list) == len(eps_list) and
+        len(h_hw_list) == len(eps_list) and
+        len(h_ideal_list) > 0
+    )
     
     # Run diagnosis
     try:
-        results = diagnose_input_dependence(x_processed, eps_list, ref_idx=0)
+        results = diagnose_input_dependence(
+            x_processed, eps_list, ref_idx=0,
+            model=model if can_compute_sensitivity else None,
+            criterion=criterion if can_compute_sensitivity else None,
+            inputs_list=inputs_matched if can_compute_sensitivity else None,
+            targets_list=targets_matched if can_compute_sensitivity else None,
+            h_ideal_list=h_ideal_list if can_compute_sensitivity else None,
+            h_hw_list=h_hw_list if can_compute_sensitivity else None,
+            layer_module=layer_module if can_compute_sensitivity else None,
+            device=device if can_compute_sensitivity else None,
+        )
         
         return {
             'error_variance': results['error_variance'],
             'mean_correlation': results['mean_correlation'],
             'static_deltaW_residual_ratio_mean': np.mean(results['static_deltaW_residual_ratios'][1:]) if len(results['static_deltaW_residual_ratios']) > 1 else np.nan,
+            'loss_sensitivity_weighted_error': results.get('loss_sensitivity_weighted_error', np.nan),
+            'loss_sensitivity_weighted_error_abs': results.get('loss_sensitivity_weighted_error_abs', np.nan),
         }
     except Exception as e:
         print(f"Warning: Error computing input dependence for {layer_name}: {e}")
@@ -327,6 +405,8 @@ def compute_layer_input_dependence(
             'error_variance': np.nan,
             'mean_correlation': np.nan,
             'static_deltaW_residual_ratio_mean': np.nan,
+            'loss_sensitivity_weighted_error': np.nan,
+            'loss_sensitivity_weighted_error_abs': np.nan,
         }
 
 

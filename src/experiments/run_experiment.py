@@ -8,6 +8,7 @@ import logging
 import pandas as pd
 import math
 import time
+import numpy as np
 
 try:
     from ..models.model_zoo import get_model, wrap_model_with_memristor
@@ -312,7 +313,20 @@ def run_experiment(
             ir_drop_cap=float(ir_drop_cap),
             ir_drop_norm=str(ir_drop_norm),
             ir_drop_train_enabled=bool(ir_drop_train_enabled),
+            enable_adc_during_training=bool(memristor_config.get('enable_adc_during_training', False)),
+            adc_training_mode=str(memristor_config.get('adc_training_mode', 'ste')),  # Default to 'ste' for backward compatibility
+            enable_ir_drop_paper_during_training=bool(memristor_config.get('enable_ir_drop_paper_during_training', False)),
         )
+        
+        # Log ADC training mode for debugging
+        adc_mode_from_config = memristor_config.get('adc_training_mode', None)
+        print(f"[DEBUG CONFIG] adc_training_mode from config: {adc_mode_from_config}")
+        print(f"[DEBUG CONFIG] adc_training_mode in device_model: {device_model.adc_training_mode}")
+        if device_model.enable_adc_during_training:
+            logger.info(f"ADC training enabled with mode: {device_model.adc_training_mode}")
+            print(f"[DEBUG] Device model ADC settings: enable_adc={device_model.enable_adc}, "
+                  f"enable_adc_during_training={device_model.enable_adc_during_training}, "
+                  f"adc_training_mode={device_model.adc_training_mode}")
         
         # Check if learned mapping is used
         compensation_method = config['experiment'].get('compensation_method', 'hat')
@@ -422,8 +436,14 @@ def run_experiment(
     epoch_times = []
     training_start_time = time.time()
     
+    # Debug: Log training loop start
+    experiment_logger.info(f"Starting training loop: start_epoch={start_epoch}, epochs={epochs}")
+    experiment_logger.info(f"Experiment mode: {experiment_mode}")
+    
     for epoch in range(start_epoch, epochs):
         epoch_start_time = time.time()
+        experiment_logger.info(f"Epoch {epoch}/{epochs-1} starting...")
+        
         # 重置能耗统计（如果启用，每个epoch开始时重置）
         if device_model and hasattr(device_model, 'enable_energy') and device_model.enable_energy:
             device_model.reset_energy_stats()
@@ -515,6 +535,15 @@ def run_experiment(
             'val_acc1': val_metrics['acc1'],
             'lr': optimizer.param_groups[0]['lr'],
         }
+        
+        # Add gradient statistics if available (for training dynamics analysis)
+        if 'grad_norm' in train_metrics:
+            metrics['grad_norm'] = train_metrics['grad_norm']
+            metrics['grad_norm_std'] = train_metrics.get('grad_norm_std', 0.0)
+            metrics['grad_var'] = train_metrics.get('grad_var', 0.0)
+        if 'update_std' in train_metrics:
+            metrics['update_std'] = train_metrics.get('update_std', 0.0)
+        
         metrics_history.append(metrics)
         
         if tb_writer:
@@ -523,6 +552,16 @@ def run_experiment(
             tb_writer.add_scalar('Val/Loss', metrics['val_loss'], epoch)
             tb_writer.add_scalar('Val/Acc1', metrics['val_acc1'], epoch)
             tb_writer.add_scalar('LR', metrics['lr'], epoch)
+            if 'grad_norm' in metrics:
+                tb_writer.add_scalar('Train/GradNorm', metrics['grad_norm'], epoch)
+                tb_writer.add_scalar('Train/GradNormStd', metrics['grad_norm_std'], epoch)
+                tb_writer.add_scalar('Train/GradVar', metrics['grad_var'], epoch)
+            if 'update_std' in metrics:
+                tb_writer.add_scalar('Train/UpdateStd', metrics['update_std'], epoch)
+            if 'synthetic_noise_avg_g' in metrics:
+                tb_writer.add_scalar('SyntheticNoise/AvgG', metrics['synthetic_noise_avg_g'], epoch)
+                tb_writer.add_scalar('SyntheticNoise/AvgR', metrics['synthetic_noise_avg_r'], epoch)
+                tb_writer.add_scalar('SyntheticNoise/EMANorm', metrics['synthetic_noise_ema_norm'], epoch)
         
         if wandb_run:
             wandb.log(metrics, step=epoch)
@@ -562,8 +601,18 @@ def run_experiment(
             f"Epoch {epoch}/{epochs-1}: train_loss={metrics['train_loss']:.4f}, "
             f"train_acc={metrics['train_acc1']:.2f}%, "
             f"val_loss={metrics['val_loss']:.4f}, val_acc={metrics['val_acc1']:.2f}%"
-            f" | Time: {epoch_time_str} | ETA: {eta_str}"
         )
+        
+        # 添加梯度统计信息和更新量统计（如果可用）
+        if 'grad_norm' in metrics:
+            log_msg += f" | grad_norm={metrics['grad_norm']:.4e}"
+            if metrics.get('grad_norm_std', 0.0) > 0:
+                log_msg += f"±{metrics['grad_norm_std']:.4e}"
+            log_msg += f" | grad_var={metrics.get('grad_var', 0.0):.4e}"
+        if 'update_std' in metrics:
+            log_msg += f" | update_std={metrics['update_std']:.4e}"
+        
+        log_msg += f" | Time: {epoch_time_str} | ETA: {eta_str}"
         
         # 如果启用了能耗估计，添加能耗信息
         if device_model and hasattr(device_model, 'enable_energy') and device_model.enable_energy:
@@ -952,6 +1001,11 @@ def _train_baseline(
     losses = AverageMeter('Loss', ':.4f')
     top1 = AverageMeter('Acc@1', ':6.2f')
     
+    # Gradient statistics for training dynamics analysis
+    grad_norms = []  # List of gradient norms per batch
+    grad_vars = []  # List of gradient variances per batch
+    update_stds = []  # List of update standard deviations per batch
+    
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         
@@ -975,17 +1029,70 @@ def _train_baseline(
                 logger.error(error_msg)
                 raise ValueError(error_msg)
         
+        # Save weights before update (for computing update statistics)
+        weights_before = []
+        for param in model.parameters():
+            if param.requires_grad:
+                weights_before.append(param.data.clone())
+        
         optimizer.zero_grad()
         output = model(data)
         loss = criterion(output, target)
         loss.backward()
+        
+        # Compute gradient statistics before optimizer.step()
+        grad_list = []
+        for param in model.parameters():
+            if param.grad is not None:
+                grad_list.append(param.grad.flatten())
+        
+        if grad_list:
+            # Concatenate all gradients
+            all_grads = torch.cat(grad_list)
+            
+            # Compute gradient norm
+            grad_norm = all_grads.norm().item()
+            grad_norms.append(grad_norm)
+            
+            # Compute gradient variance (across all parameters)
+            grad_var = all_grads.var().item()
+            grad_vars.append(grad_var)
+        
         optimizer.step()
+        
+        # Compute update statistics (weight change after optimizer.step())
+        if weights_before:
+            updates = []
+            param_idx = 0
+            for param in model.parameters():
+                if param.requires_grad and param_idx < len(weights_before):
+                    update = (param.data - weights_before[param_idx]).flatten()
+                    updates.append(update)
+                    param_idx += 1
+            
+            if updates:
+                all_updates = torch.cat(updates)
+                update_std = all_updates.std().item()
+                update_stds.append(update_std)
         
         acc1 = accuracy(output, target, topk=(1,))[0]
         losses.update(loss.item(), data.size(0))
         top1.update(acc1, data.size(0))
     
-    return {'loss': losses.avg, 'acc1': top1.avg}
+    # Compute average gradient statistics
+    avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
+    avg_grad_var = np.mean(grad_vars) if grad_vars else 0.0
+    std_grad_norm = np.std(grad_norms) if grad_norms else 0.0
+    avg_update_std = np.mean(update_stds) if update_stds else 0.0
+    
+    return {
+        'loss': losses.avg, 
+        'acc1': top1.avg,
+        'grad_norm': avg_grad_norm,
+        'grad_norm_std': std_grad_norm,
+        'grad_var': avg_grad_var,
+        'update_std': avg_update_std,
+    }
 
 
 def _train_learned_mapping(
@@ -1043,8 +1150,19 @@ def _train_learned_mapping(
         losses = AverageMeter('Loss', ':.4f')
         top1 = AverageMeter('Acc@1', ':6.2f')
         
+        # Gradient statistics for training dynamics analysis
+        grad_norms = []
+        grad_vars = []
+        update_stds = []
+        
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
+            
+            # Save weights before update
+            weights_before = []
+            for param in model.parameters():
+                if param.requires_grad:
+                    weights_before.append(param.data.clone())
             
             optimizer.zero_grad()
             
@@ -1069,16 +1187,54 @@ def _train_learned_mapping(
                 loss = loss_task + lambda_boundary * boundary_reg
             
             loss.backward()
+            
+            # Compute gradient statistics
+            grad_list = []
+            for param in model.parameters():
+                if param.grad is not None:
+                    grad_list.append(param.grad.flatten())
+            
+            if grad_list:
+                all_grads = torch.cat(grad_list)
+                grad_norm = all_grads.norm().item()
+                grad_norms.append(grad_norm)
+                grad_var = all_grads.var().item()
+                grad_vars.append(grad_var)
+            
             optimizer.step()
+            
+            # Compute update statistics
+            if weights_before:
+                updates = []
+                param_idx = 0
+                for param in model.parameters():
+                    if param.requires_grad and param_idx < len(weights_before):
+                        update = (param.data - weights_before[param_idx]).flatten()
+                        updates.append(update)
+                        param_idx += 1
+                
+                if updates:
+                    all_updates = torch.cat(updates)
+                    update_std = all_updates.std().item()
+                    update_stds.append(update_std)
             
             acc1 = accuracy(output, target, topk=(1,))[0]
             losses.update(loss.item(), data.size(0))
             top1.update(acc1, data.size(0))
         
+        avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
+        avg_grad_var = np.mean(grad_vars) if grad_vars else 0.0
+        std_grad_norm = np.std(grad_norms) if grad_norms else 0.0
+        avg_update_std = np.mean(update_stds) if update_stds else 0.0
+        
         return {
             'loss': losses.avg,
             'acc1': top1.avg,
             'mapping_loss': 0.0,
+            'grad_norm': avg_grad_norm,
+            'grad_norm_std': std_grad_norm,
+            'grad_var': avg_grad_var,
+            'update_std': avg_update_std,
         }
     else:
         # Joint training mode: Alternate between mapping_net and main model
@@ -1166,6 +1322,11 @@ def _train_learned_mapping(
         losses = AverageMeter('Loss', ':.4f')
         top1 = AverageMeter('Acc@1', ':6.2f')
         
+        # Gradient statistics for training dynamics analysis
+        grad_norms = []
+        grad_vars = []
+        update_stds = []
+        
         # Train the main model with learned mapping applied
         # The mapping_net is already trained and set in layers
         # Now we need to train the main model weights while keeping mapping_net fixed
@@ -1175,6 +1336,12 @@ def _train_learned_mapping(
         
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
+            
+            # Save weights before update
+            weights_before = []
+            for param in model.parameters():
+                if param.requires_grad:
+                    weights_before.append(param.data.clone())
             
             optimizer.zero_grad()
             
@@ -1199,16 +1366,54 @@ def _train_learned_mapping(
             # Backward pass to update main model weights
             # mapping_net parameters are frozen, so only main model weights will be updated
             loss.backward()
+            
+            # Compute gradient statistics
+            grad_list = []
+            for param in model.parameters():
+                if param.grad is not None:
+                    grad_list.append(param.grad.flatten())
+            
+            if grad_list:
+                all_grads = torch.cat(grad_list)
+                grad_norm = all_grads.norm().item()
+                grad_norms.append(grad_norm)
+                grad_var = all_grads.var().item()
+                grad_vars.append(grad_var)
+            
             optimizer.step()
+            
+            # Compute update statistics
+            if weights_before:
+                updates = []
+                param_idx = 0
+                for param in model.parameters():
+                    if param.requires_grad and param_idx < len(weights_before):
+                        update = (param.data - weights_before[param_idx]).flatten()
+                        updates.append(update)
+                        param_idx += 1
+                
+                if updates:
+                    all_updates = torch.cat(updates)
+                    update_std = all_updates.std().item()
+                    update_stds.append(update_std)
             
             acc1 = accuracy(output, target, topk=(1,))[0]
             losses.update(loss.item(), data.size(0))
             top1.update(acc1, data.size(0))
         
+        avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
+        avg_grad_var = np.mean(grad_vars) if grad_vars else 0.0
+        std_grad_norm = np.std(grad_norms) if grad_norms else 0.0
+        avg_update_std = np.mean(update_stds) if update_stds else 0.0
+        
         return {
             'loss': losses.avg,
             'acc1': top1.avg,
             'mapping_loss': mapping_results.get('best_loss', 0.0),
+            'grad_norm': avg_grad_norm,
+            'grad_norm_std': std_grad_norm,
+            'grad_var': avg_grad_var,
+            'update_std': avg_update_std,
         }
 
 
@@ -1498,6 +1703,11 @@ def _train_hat(
     losses = AverageMeter('Loss', ':.4f')
     top1 = AverageMeter('Acc@1', ':6.2f')
     
+    # Gradient statistics for training dynamics analysis
+    grad_norms = []  # List of gradient norms per batch
+    grad_vars = []  # List of gradient variances per batch
+    update_stds = []  # List of update standard deviations per batch
+    
     # Ensure no mapping_net is set for HAT training
     # If model has base_model (MemristorModel wrapper), check both
     target_model = model
@@ -1515,6 +1725,12 @@ def _train_hat(
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         
+        # Save weights before update (for computing update statistics)
+        weights_before = []
+        for param in model.parameters():
+            if param.requires_grad:
+                weights_before.append(param.data.clone())
+        
         optimizer.zero_grad()
         
         # Forward with non-idealities (t increases with each batch)
@@ -1529,7 +1745,17 @@ def _train_hat(
             # Fallback if model doesn't accept t parameter
             output = model(data)
         
+        # Check for NaN in output
+        if torch.isnan(output).any():
+            logger.warning(f"NaN detected in output at epoch {epoch}, batch {batch_idx}. Skipping batch.")
+            continue
+        
         loss_task = criterion(output, target)
+        
+        # Check for NaN in loss
+        if torch.isnan(loss_task) or torch.isinf(loss_task):
+            logger.warning(f"NaN/Inf detected in loss at epoch {epoch}, batch {batch_idx}. Skipping batch.")
+            continue
         
         # Boundary regularization (if enabled)
         loss = loss_task
@@ -1542,13 +1768,72 @@ def _train_hat(
                 loss = loss_task + lambda_boundary * boundary_reg
         
         loss.backward()
+        
+        # Compute gradient statistics before optimizer.step()
+        # Get all parameter gradients
+        grad_list = []
+        for param in model.parameters():
+            if param.grad is not None:
+                grad_list.append(param.grad.flatten())
+        
+        if grad_list:
+            # Concatenate all gradients
+            all_grads = torch.cat(grad_list)
+            
+            # Compute gradient norm
+            grad_norm = all_grads.norm().item()
+            grad_norms.append(grad_norm)
+            
+            # Compute gradient variance (across all parameters)
+            grad_var = all_grads.var().item()
+            grad_vars.append(grad_var)
+            
+            # Debug: log very small gradients (potential gradient vanishing)
+            if grad_norm < 1e-6 and batch_idx == 0:
+                logger.warning(f"Very small gradient norm detected: {grad_norm:.2e} at epoch {epoch}, batch {batch_idx}. "
+                             f"This may indicate gradient vanishing (e.g., direct ADC mode).")
+            
+            # Check for gradient explosion
+            if grad_norm > 1e6:
+                logger.warning(f"Large gradient norm detected: {grad_norm:.2e} at epoch {epoch}, batch {batch_idx}")
+                # Clip gradients to prevent explosion
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
+        
+        # Compute update statistics (weight change after optimizer.step())
+        if weights_before:
+            updates = []
+            param_idx = 0
+            for param in model.parameters():
+                if param.requires_grad and param_idx < len(weights_before):
+                    update = (param.data - weights_before[param_idx]).flatten()
+                    updates.append(update)
+                    param_idx += 1
+            
+            if updates:
+                all_updates = torch.cat(updates)
+                update_std = all_updates.std().item()
+                update_stds.append(update_std)
         
         acc1 = accuracy(output, target, topk=(1,))[0]
         losses.update(loss.item(), data.size(0))
         top1.update(acc1, data.size(0))
     
-    return {'loss': losses.avg, 'acc1': top1.avg}
+    # Compute average gradient statistics
+    avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
+    avg_grad_var = np.mean(grad_vars) if grad_vars else 0.0
+    std_grad_norm = np.std(grad_norms) if grad_norms else 0.0
+    avg_update_std = np.mean(update_stds) if update_stds else 0.0
+    
+    return {
+        'loss': losses.avg, 
+        'acc1': top1.avg,
+        'grad_norm': avg_grad_norm,
+        'grad_norm_std': std_grad_norm,
+        'grad_var': avg_grad_var,
+        'update_std': avg_update_std,
+    }
 
 
 def _validate_baseline(

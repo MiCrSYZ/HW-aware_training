@@ -76,6 +76,9 @@ class MemristorDeviceModel:
         ir_drop_cap: float = 0.10,  # 单列最大衰减上限（crossbar模式）
         ir_drop_norm: str = 'mean',  # 列活动归一化方式（crossbar模式）：'mean' 或 'max'
         ir_drop_train_enabled: bool = True,  # crossbar模式下是否在训练时注入IR-drop（True=训练和推理都注入，False=仅推理时注入）
+        enable_adc_during_training: bool = False,  # 是否在训练时启用ADC量化（默认False，因为ADC量化会导致梯度消失）
+        adc_training_mode: str = 'ste',  # ADC训练模式：'ste'（使用Straight-Through Estimator）或'direct'（直接量化，梯度会消失）
+        enable_ir_drop_paper_during_training: bool = False,  # 是否在训练时启用paper版IR-drop（默认False，因为可能导致梯度不稳定）
     ):
         self.G_min = G_min
         self.G_max = G_max
@@ -138,6 +141,9 @@ class MemristorDeviceModel:
         self.ir_drop_cap = ir_drop_cap
         self.ir_drop_norm = ir_drop_norm
         self.ir_drop_train_enabled = ir_drop_train_enabled
+        self.enable_adc_during_training = enable_adc_during_training
+        self.adc_training_mode = adc_training_mode  # 'ste' or 'direct'
+        self.enable_ir_drop_paper_during_training = enable_ir_drop_paper_during_training
         
         # 存储 seed 用于生成固定的 stuck mask
         self.seed = seed

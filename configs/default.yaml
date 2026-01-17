@@ -54,6 +54,7 @@ memristor:
   ir_drop_eta: 1.0  # 位置因子幂次（crossbar模式）
   ir_drop_cap: 0.10  # 单列最大衰减上限（crossbar模式）
   ir_drop_norm: mean  # 列活动归一化方式（crossbar模式）：'mean' 或 'max'
+  ir_drop_train_enabled: true  # crossbar模式下是否在训练时注入IR-drop（true=训练和推理都注入，false=仅推理时注入）
   # 电导漂移时间设置方式
   drift_time_mode: accumulate  # 'fixed' 或 'accumulate'：固定值或模拟真实器件老化（t随推理次数累加）
   drift_time_fixed: 0  # 固定值模式下的t值（仅在drift_time_mode='fixed'时生效）
@@ -65,6 +66,10 @@ memristor:
   enable_adc: false  # 启用ADC量化
   adc_add_noise: false  # ADC量化是否添加噪声
   enable_energy: false  # 启用能耗估计
+  # 训练时噪声注入控制（用于研究可学习与不可学习噪声的边界）
+  enable_adc_during_training: false  # 是否在训练时启用ADC量化（默认false，因为会导致梯度消失）
+  adc_training_mode: ste  # ADC训练模式：'ste'（使用Straight-Through Estimator，保持梯度流）或'direct'（直接量化，梯度会消失，用于观察训练崩溃）
+  enable_ir_drop_paper_during_training: false  # 是否在训练时启用paper版IR-drop（默认false，因为可能导致梯度不稳定）
   
   # 写入更新模型参数（仅在enable_update_model=true时生效）
   update_params:

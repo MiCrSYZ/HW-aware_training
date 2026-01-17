@@ -56,37 +56,113 @@ def hardware_linear_forward_adaptive(
         out = F.linear(x, W_eff)
 
     # Final ADC quantization AFTER tile-sum
-    # Only apply ADC quantization during inference (not during training) to preserve gradients
-    if hasattr(device_model, "enable_adc") and device_model.enable_adc and not training:
-        out = device_model.adc_quant(out, bits=device_model.adc_bits)
+    # Apply ADC quantization if enabled and (inference OR training with enable_adc_during_training)
+    
+    # Debug: always check and log ADC status (only once)
+    if training and not hasattr(device_model, '_adc_check_logged'):
+        has_enable_adc = hasattr(device_model, "enable_adc")
+        enable_adc_value = getattr(device_model, "enable_adc", None) if has_enable_adc else None
+        enable_adc_during_training_value = getattr(device_model, "enable_adc_during_training", None)
+        print(f"[DEBUG ADC CHECK] hasattr(enable_adc)={has_enable_adc}, enable_adc={enable_adc_value}, "
+              f"enable_adc_during_training={enable_adc_during_training_value}, training={training}")
+        device_model._adc_check_logged = True
+    
+    if hasattr(device_model, "enable_adc") and device_model.enable_adc:
+        enable_adc_during_training = getattr(device_model, "enable_adc_during_training", False)
+        should_apply_adc = not training or enable_adc_during_training
+        
+        # Debug: print ADC status (only once per training session)
+        if training and not hasattr(device_model, '_adc_status_logged'):
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"ADC status check: enable_adc={device_model.enable_adc}, "
+                       f"enable_adc_during_training={enable_adc_during_training}, "
+                       f"training={training}, should_apply_adc={should_apply_adc}")
+            device_model._adc_status_logged = True
+        
+        if should_apply_adc:
+            if training:
+                # Training mode: choose between STE and direct quantization
+                adc_mode = getattr(device_model, 'adc_training_mode', 'direct')  # Default to 'ste' for backward compatibility（别给我默认ste）
+                
+                # Debug: print mode (only once per training session to avoid spam)
+                if not hasattr(device_model, '_adc_mode_logged'):
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    print(f"[DEBUG] ADC training mode: {adc_mode}")
+                    print(f"[DEBUG] enable_adc={device_model.enable_adc}, enable_adc_during_training={enable_adc_during_training}")
+                    logger.info(f"ADC training mode: {adc_mode} (enable_adc_during_training={enable_adc_during_training})")
+                    if adc_mode == 'direct':
+                        print("[WARNING] Direct mode: gradients will be completely blocked (detached), training may collapse!")
+                    device_model._adc_mode_logged = True
+                
+                if adc_mode == 'ste':
+                    # Use straight-through estimator (STE): forward uses quantized value, backward uses identity
+                    # This allows gradients to flow through, but forward uses quantized values
+                    out_quantized = device_model.adc_quant(out, bits=device_model.adc_bits)
+                    out = out + (out_quantized - out).detach()
+                elif adc_mode == 'direct':
+                    # Direct quantization: completely block gradients by detaching the quantized output
+                    # This is used to observe the effect of gradient vanishing on training dynamics
+                    # Note: torch.round() actually has gradient=1 (straight-through), so we need to detach
+                    # to truly block gradients and observe training collapse
+                    out_quantized = device_model.adc_quant(out, bits=device_model.adc_bits)
+                    # Completely detach to block all gradients (unlike STE which uses original gradients)
+                    out = out_quantized.detach()
+                else:
+                    raise ValueError(f"Unknown adc_training_mode: {adc_mode}. Must be 'ste' or 'direct'.")
+            else:
+                # Inference mode: always use direct quantization
+                out = device_model.adc_quant(out, bits=device_model.adc_bits)
 
     # Apply new IR-drop correction based on paper equations (16)-(18) if enabled
-    # For 'paper' mode, only apply IR-drop during inference (not during training)
-    if device_model.ir_drop_mode == "paper" and not training:
-        # Compute normalization factors
-        W_abs_max = torch.abs(W_eff).max().clamp(min=1e-8)  # Avoid division by zero
-        x_abs_max = torch.abs(x).max().clamp(min=1e-8)
-        
-        # Normalize weights: W_tilde = W_eff / W_abs_max (keeps values in [-1, 1] range)
-        W_tilde_normalized = W_eff / W_abs_max  # [out_features, in_features]
-        
-        # Normalize inputs: x_tilde = x / x_abs_max (keeps values in reasonable range)
-        x_tilde_normalized = x / x_abs_max  # [batch, in_features]
-        
-        # Normalize output: y_tilde = out / (W_abs_max * x_abs_max) to maintain scale consistency
-        # This ensures y_tilde has similar magnitude to the normalized computation
-        output_scale = W_abs_max * x_abs_max
-        y_tilde = out / (output_scale + 1e-12)  # [batch, out_features]
-        
-        # Apply IR-drop correction
-        y_tilde_with_ir = device_model.apply_ir_drop_paper(
-            y_tilde,
-            W_tilde_normalized,
-            x_tilde_normalized
-        )
-        
-        # Convert back to physical scale
-        out = y_tilde_with_ir * output_scale
+    # Apply IR-drop if enabled and (inference OR training with enable_ir_drop_paper_during_training)
+    if device_model.ir_drop_mode == "paper":
+        should_apply_ir = not training or (hasattr(device_model, "enable_ir_drop_paper_during_training") and device_model.enable_ir_drop_paper_during_training)
+        if should_apply_ir:
+            # Compute normalization factors with numerical stability protection
+            W_abs_max = torch.abs(W_eff).max().clamp(min=1e-8)  # Avoid division by zero
+            x_abs_max = torch.abs(x).max().clamp(min=1e-8)
+            
+            # Normalize weights: W_tilde = W_eff / W_abs_max (keeps values in [-1, 1] range)
+            W_tilde_normalized = W_eff / W_abs_max  # [out_features, in_features]
+            
+            # Normalize inputs: x_tilde = x / x_abs_max (keeps values in reasonable range)
+            x_tilde_normalized = x / x_abs_max  # [batch, in_features]
+            
+            # Normalize output: y_tilde = out / (W_abs_max * x_abs_max) to maintain scale consistency
+            # This ensures y_tilde has similar magnitude to the normalized computation
+            output_scale = W_abs_max * x_abs_max
+            y_tilde = out / (output_scale + 1e-12)  # [batch, out_features]
+            
+            # Apply IR-drop correction
+            # Note: We do NOT skip NaN/Inf in training - this is intentional to observe
+            # whether paper IR-drop causes numerical instability (proving its unlearnability)
+            try:
+                y_tilde_with_ir = device_model.apply_ir_drop_paper(
+                    y_tilde,
+                    W_tilde_normalized,
+                    x_tilde_normalized
+                )
+                
+                # Convert back to physical scale
+                out_ir = y_tilde_with_ir * output_scale
+                
+                # Use IR-drop output directly (including NaN/Inf if present)
+                # This allows us to observe numerical instability in training
+                out = out_ir
+                
+            except Exception as e:
+                # If IR-drop computation fails, raise the error instead of silently skipping
+                # This is important for the matched-distortion experiment to detect failures
+                if training:
+                    # In training, raise the error to observe failures
+                    raise RuntimeError(f"IR-drop computation failed during training: {e}") from e
+                else:
+                    # In inference, log the error but continue
+                    import warnings
+                    warnings.warn(f"IR-drop computation failed: {e}. Using original output.")
+                    pass  # out remains unchanged
 
     return out, (Gp_noisy, Gn_noisy, W_eff_conductance, scale)
 

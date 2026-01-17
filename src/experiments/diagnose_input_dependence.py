@@ -260,6 +260,12 @@ def analyze_linear_layer(
     device_model: MemristorDeviceModel,
     t: int = 0,
     seed: Optional[int] = None,
+    model: Optional[nn.Module] = None,
+    criterion: Optional[nn.Module] = None,
+    inputs_list: Optional[List[torch.Tensor]] = None,
+    targets_list: Optional[List[torch.Tensor]] = None,
+    layer_module: Optional[nn.Module] = None,
+    device: Optional[torch.device] = None,
 ) -> Tuple[Dict[str, Any], List[torch.Tensor]]:
     """
     Analyze input dependence for a linear layer.
@@ -270,6 +276,12 @@ def analyze_linear_layer(
         device_model: Device model
         t: Time/cycle index
         seed: Random seed
+        model: (Optional) Neural network model for loss-sensitivity computation
+        criterion: (Optional) Loss function for loss-sensitivity computation
+        inputs_list: (Optional) List of full input batches for model forward pass
+        targets_list: (Optional) List of target labels for loss computation
+        layer_module: (Optional) Layer module to compute gradients for
+        device: (Optional) Device to run computation on
         
     Returns:
         Tuple of (diagnostic results dictionary, list of error tensors)
@@ -277,6 +289,9 @@ def analyze_linear_layer(
     # Compute hardware errors for each input
     eps_list = []
     x_processed = []
+    h_ideal_list = []
+    h_hw_list = []
+    
     for x in x_list:
         # Ensure x is 2D [B, in_dim]
         if x.dim() > 2:
@@ -285,9 +300,29 @@ def analyze_linear_layer(
         
         eps = hardware_error(x, W, device_model, t=t, seed=seed)
         eps_list.append(eps)
+        
+        # Compute ideal and hardware outputs for loss-sensitivity computation
+        if model is not None and layer_module is not None:
+            import torch.nn.functional as F
+            # Ideal output: x @ W.T
+            h_ideal = F.linear(x, W)
+            h_ideal_list.append(h_ideal)
+            # Hardware output: ideal + error
+            h_hw = h_ideal + eps
+            h_hw_list.append(h_hw)
     
     # Run comprehensive diagnosis
-    results = diagnose_input_dependence(x_processed, eps_list, ref_idx=0)
+    results = diagnose_input_dependence(
+        x_processed, eps_list, ref_idx=0,
+        model=model,
+        criterion=criterion,
+        inputs_list=inputs_list,
+        targets_list=targets_list,
+        h_ideal_list=h_ideal_list if h_ideal_list else None,
+        h_hw_list=h_hw_list if h_hw_list else None,
+        layer_module=layer_module,
+        device=device,
+    )
     
     return results, eps_list
 
@@ -299,6 +334,11 @@ def analyze_conv2d_layer(
     device_model: MemristorDeviceModel,
     t: int = 0,
     seed: Optional[int] = None,
+    model: Optional[nn.Module] = None,
+    criterion: Optional[nn.Module] = None,
+    inputs_list: Optional[List[torch.Tensor]] = None,
+    targets_list: Optional[List[torch.Tensor]] = None,
+    device: Optional[torch.device] = None,
 ) -> Tuple[Dict[str, Any], List[torch.Tensor]]:
     """
     Analyze input dependence for a Conv2d layer.
@@ -310,6 +350,11 @@ def analyze_conv2d_layer(
         device_model: Device model
         t: Time/cycle index
         seed: Random seed
+        model: (Optional) Neural network model for loss-sensitivity computation
+        criterion: (Optional) Loss function for loss-sensitivity computation
+        inputs_list: (Optional) List of full input batches for model forward pass
+        targets_list: (Optional) List of target labels for loss computation
+        device: (Optional) Device to run computation on
         
     Returns:
         Tuple of (diagnostic results dictionary, list of error tensors)
@@ -365,6 +410,8 @@ def analyze_conv2d_layer(
     # Process each input
     eps_list = []
     x_processed = []
+    h_ideal_list = []
+    h_hw_list = []
     
     for x in x_list:
         # Ensure x is 4D [B, C, H, W]
@@ -400,9 +447,60 @@ def analyze_conv2d_layer(
         
         eps_list.append(eps_flat_for_analysis)
         x_processed.append(x_flat_for_analysis)
+        
+        # Compute ideal and hardware outputs for loss-sensitivity computation
+        if model is not None and layer_module is not None:
+            try:
+                # Ideal output: F.conv2d(x, W, ...)
+                # x is 4D [B, C, H, W], W is 4D [out_ch, in_ch, k_h, k_w]
+                # Output will be 4D [B, out_ch, H_out, W_out]
+                # F.conv2d expects padding as int or (int, int) tuple
+                h_ideal_4d = F.conv2d(x, W, stride=(stride_h, stride_w), padding=(pad_h, pad_w))
+                
+                # Store the 4D version for the forward hook
+                # The forward hook needs the exact shape that the layer would normally output
+                h_ideal_list.append(h_ideal_4d)  # Store 4D version [B, out_ch, H_out, W_out]
+                
+                # For matching with eps, we need to flatten
+                # eps_flat_for_analysis is [B*num_patches, out_ch]
+                # h_ideal_4d is [B, out_ch, H_out, W_out]
+                # Reshape to match the patch structure
+                h_ideal_flat = h_ideal_4d.permute(0, 2, 3, 1).reshape(-1, out_ch)  # [B*H_out*W_out, out_ch]
+                
+                # Match dimensions with eps_flat_for_analysis
+                if h_ideal_flat.shape[0] == eps_flat_for_analysis.shape[0]:
+                    # Hardware output: ideal + error (flattened for matching)
+                    h_hw_flat = h_ideal_flat + eps_flat_for_analysis
+                else:
+                    # Dimensions don't match, create a dummy that matches eps shape
+                    h_hw_flat = torch.zeros_like(eps_flat_for_analysis)
+                h_hw_list.append(h_hw_flat)
+            except Exception as e:
+                # If computation fails, skip this sample for sensitivity computation
+                # But we still need to store something to maintain list length
+                print(f"Warning: Failed to compute ideal output for conv layer: {e}")
+                # Store a dummy 4D tensor with the expected output shape
+                # We need to infer the output shape from the input and conv parameters
+                B = x.shape[0]
+                H_out = (x.shape[2] + 2 * pad_h - k_h) // stride_h + 1
+                W_out = (x.shape[3] + 2 * pad_w - k_w) // stride_w + 1
+                h_ideal_dummy = torch.zeros(B, out_ch, H_out, W_out, device=x.device)
+                h_ideal_list.append(h_ideal_dummy)
+                h_hw_dummy = torch.zeros_like(eps_flat_for_analysis)
+                h_hw_list.append(h_hw_dummy)
     
     # Run comprehensive diagnosis
-    results = diagnose_input_dependence(x_processed, eps_list, ref_idx=0)
+    results = diagnose_input_dependence(
+        x_processed, eps_list, ref_idx=0,
+        model=model,
+        criterion=criterion,
+        inputs_list=inputs_list,
+        targets_list=targets_list,
+        h_ideal_list=h_ideal_list if h_ideal_list else None,
+        h_hw_list=h_hw_list if h_hw_list else None,
+        layer_module=layer_module,
+        device=device,
+    )
     
     # Return both results and eps_list for visualization
     # Note: eps_list contains flattened errors [B*num_patches, out_ch]
@@ -525,12 +623,14 @@ def analyze_multiple_layers(
     
     print(f"\nAnalyzing {len(layers_to_analyze)} layers: {list(layers_to_analyze.keys())}")
     
-    # Sample inputs once (shared across all layers)
+    # Sample inputs and targets once (shared across all layers)
     print(f"\nSampling {args.num_samples} input batches...")
     model_inputs = []
+    model_targets = []
     count = 0
-    for data, _ in eval_loader:
+    for data, target in eval_loader:
         model_inputs.append(data[:args.batch_size].to(device))
+        model_targets.append(target[:args.batch_size].to(device))
         count += 1
         if count >= args.num_samples:
             break
@@ -556,6 +656,9 @@ def analyze_multiple_layers(
         is_linear = isinstance(layer_module, (nn.Linear, MemristorLinear, LearnedMappingMemristorLinear))
         is_conv = isinstance(layer_module, (nn.Conv2d, MemristorConv2d, LearnedMappingMemristorConv2d))
         
+        # Create criterion for loss-sensitivity computation
+        criterion = nn.CrossEntropyLoss()
+        
         if is_linear:
             # Process inputs for linear
             x_processed = []
@@ -565,11 +668,22 @@ def analyze_multiple_layers(
                 x_processed.append(x)
             
             results, eps_list = analyze_linear_layer(
-                x_processed, W, device_model, t=args.t, seed=args.seed
+                x_processed, W, device_model, t=args.t, seed=args.seed,
+                model=model,
+                criterion=criterion,
+                inputs_list=model_inputs,
+                targets_list=model_targets,
+                layer_module=layer_module,
+                device=device,
             )
         elif is_conv:
             results, eps_list = analyze_conv2d_layer(
-                layer_inputs, W, layer_module, device_model, t=args.t, seed=args.seed
+                layer_inputs, W, layer_module, device_model, t=args.t, seed=args.seed,
+                model=model,
+                criterion=criterion,
+                inputs_list=model_inputs,
+                targets_list=model_targets,
+                device=device,
             )
         else:
             print(f"Warning: Unsupported layer type for {layer_name}, skipping")
@@ -587,6 +701,11 @@ def analyze_multiple_layers(
         print(f"  Mean correlation: {results['mean_correlation']:.4f}")
         avg_residual = np.mean(results['static_deltaW_residual_ratios'][1:]) if len(results['static_deltaW_residual_ratios']) > 1 else np.nan
         print(f"  Avg residual ratio: {avg_residual:.4f}")
+        # Print loss-sensitivity weighted error if available
+        if 'loss_sensitivity_weighted_error' in results and not np.isnan(results['loss_sensitivity_weighted_error']):
+            print(f"  Loss-sensitivity weighted error (S_ℓ): {results['loss_sensitivity_weighted_error']:.6e}")
+        if 'loss_sensitivity_weighted_error_abs' in results and not np.isnan(results['loss_sensitivity_weighted_error_abs']):
+            print(f"  Loss-sensitivity weighted error (abs, S_ℓ^abs): {results['loss_sensitivity_weighted_error_abs']:.6e}")
     
     return all_results
 
@@ -782,20 +901,26 @@ def main():
         print("\n" + "="*60)
         print("SUMMARY TABLE")
         print("="*60)
-        print(f"{'Layer':<30} {'Error Var':<15} {'Correlation':<15} {'Residual Ratio':<15}")
-        print("-" * 75)
+        print(f"{'Layer':<30} {'Error Var':<15} {'Correlation':<15} {'Residual Ratio':<15} {'S_ℓ':<15} {'S_ℓ^abs':<15}")
+        print("-" * 105)
         
         summary_data = []
         for layer_name, layer_data in all_results.items():
             results = layer_data['results']
             avg_residual = np.mean(results['static_deltaW_residual_ratios'][1:]) if len(results['static_deltaW_residual_ratios']) > 1 else np.nan
+            s_ell = results.get('loss_sensitivity_weighted_error', np.nan)
+            s_ell_abs = results.get('loss_sensitivity_weighted_error_abs', np.nan)
             summary_data.append({
                 'layer': layer_name,
                 'error_variance': results['error_variance'],
                 'mean_correlation': results['mean_correlation'],
                 'residual_ratio': avg_residual,
+                'loss_sensitivity_weighted_error': s_ell,
+                'loss_sensitivity_weighted_error_abs': s_ell_abs,
             })
-            print(f"{layer_name:<30} {results['error_variance']:<15.6e} {results['mean_correlation']:<15.4f} {avg_residual:<15.4f}")
+            s_ell_str = f"{s_ell:.6e}" if not np.isnan(s_ell) else "N/A"
+            s_ell_abs_str = f"{s_ell_abs:.6e}" if not np.isnan(s_ell_abs) else "N/A"
+            print(f"{layer_name:<30} {results['error_variance']:<15.6e} {results['mean_correlation']:<15.4f} {avg_residual:<15.4f} {s_ell_str:<15} {s_ell_abs_str:<15}")
         
         # Save summary CSV
         output_dir = Path(args.output_dir)
@@ -822,9 +947,17 @@ def main():
         layer_name_arg = args.layers[0] if args.layers else args.layer
         layer_module, layer_name, W = select_representative_layer(model, layer_name_arg)
         
-        # Sample inputs
+        # Sample inputs and targets
         print(f"\nSampling {args.num_samples} input batches...")
-        model_inputs = sample_inputs(eval_loader, args.num_samples, args.batch_size, device)
+        model_inputs = []
+        model_targets = []
+        count = 0
+        for data, target in eval_loader:
+            model_inputs.append(data[:args.batch_size].to(device))
+            model_targets.append(target[:args.batch_size].to(device))
+            count += 1
+            if count >= args.num_samples:
+                break
         
         # Extract layer inputs
         layer_inputs = []
@@ -906,13 +1039,27 @@ def main():
         # Analyze
         print("\nAnalyzing input dependence...")
         
+        # Create criterion for loss-sensitivity computation
+        criterion = nn.CrossEntropyLoss()
+        
         if isinstance(layer_module, (nn.Conv2d, MemristorConv2d, LearnedMappingMemristorConv2d)):
             results, eps_list = analyze_conv2d_layer(
-                layer_inputs, W, layer_module, device_model, t=args.t, seed=args.seed
+                layer_inputs, W, layer_module, device_model, t=args.t, seed=args.seed,
+                model=model,
+                criterion=criterion,
+                inputs_list=model_inputs,
+                targets_list=model_targets,
+                device=device,
             )
         else:
             results, eps_list = analyze_linear_layer(
-                layer_inputs, W, device_model, t=args.t, seed=args.seed
+                layer_inputs, W, device_model, t=args.t, seed=args.seed,
+                model=model,
+                criterion=criterion,
+                inputs_list=model_inputs,
+                targets_list=model_targets,
+                layer_module=layer_module,
+                device=device,
             )
         
         # Print results
@@ -926,6 +1073,12 @@ def main():
         print(f"\n(C) Static ΔW transferability:")
         print(f"  Residual norms: {[f'{r:.6e}' for r in results['static_deltaW_residuals']]}")
         print(f"  Residual ratios: {[f'{r:.4f}' for r in results['static_deltaW_residual_ratios']]}")
+        # Print loss-sensitivity weighted error if available
+        if 'loss_sensitivity_weighted_error' in results and not np.isnan(results['loss_sensitivity_weighted_error']):
+            print(f"\n(D) Loss-sensitivity weighted error:")
+            print(f"  S_ℓ = E_x [⟨∇_{layer_name} L(x), e_ℓ(x)⟩]: {results['loss_sensitivity_weighted_error']:.6e}")
+        if 'loss_sensitivity_weighted_error_abs' in results and not np.isnan(results['loss_sensitivity_weighted_error_abs']):
+            print(f"  S_ℓ^abs = E_x [||∇_{layer_name} L(x) ⊙ e_ℓ(x)||]: {results['loss_sensitivity_weighted_error_abs']:.6e}")
         
         # Interpretation
         print("\n" + "="*60)
