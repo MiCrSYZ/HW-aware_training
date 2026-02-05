@@ -110,9 +110,11 @@ def run_noise_sweep(
     results = {
         'noise_type': noise_type,
         'noise_strengths': noise_strengths,
-        'final_accuracies': [],
-        'final_losses': [],
-        'training_successful': [],  # 是否成功完成训练（没有NaN/崩溃）
+        'final_test_accuracies': [],  # 测试集准确率
+        'final_val_accuracies': [],   # 验证集准确率
+        'final_test_losses': [],      # 测试集损失
+        'final_val_losses': [],       # 验证集损失
+        'training_successful': [],    # 是否成功完成训练（没有NaN/崩溃）
     }
     
     for noise_strength in noise_strengths:
@@ -141,28 +143,46 @@ def run_noise_sweep(
             # 运行实验
             exp_results = run_experiment(config, exp_output_dir)
             
-            # 提取最终准确率和损失
+            # 提取测试集准确率和损失
+            if 'test_acc' in exp_results:
+                final_test_acc = exp_results.get('test_acc', 0.0)
+                final_test_loss = exp_results.get('test_loss', float('inf'))
+            else:
+                final_test_acc = 0.0
+                final_test_loss = float('inf')
+            
+            # 提取验证集准确率和损失（从最后一个epoch）
             if 'metrics_history' in exp_results and len(exp_results['metrics_history']) > 0:
                 final_metrics = exp_results['metrics_history'][-1]
-                final_acc = final_metrics.get('val_acc1', 0.0)
-                final_loss = final_metrics.get('val_loss', float('inf'))
+                final_val_acc = final_metrics.get('val_acc1', 0.0)
+                final_val_loss = final_metrics.get('val_loss', float('inf'))
                 training_successful = True
             else:
-                final_acc = 0.0
-                final_loss = float('inf')
+                final_val_acc = 0.0
+                final_val_loss = float('inf')
                 training_successful = False
             
-            results['final_accuracies'].append(final_acc)
-            results['final_losses'].append(final_loss)
+            # 如果test_acc不存在，使用val_acc作为fallback
+            if final_test_acc == 0.0 and final_val_acc > 0.0:
+                final_test_acc = final_val_acc
+                final_test_loss = final_val_loss
+            
+            results['final_test_accuracies'].append(final_test_acc)
+            results['final_val_accuracies'].append(final_val_acc)
+            results['final_test_losses'].append(final_test_loss)
+            results['final_val_losses'].append(final_val_loss)
             results['training_successful'].append(training_successful)
             
-            print(f"Final accuracy: {final_acc:.2f}%")
+            print(f"Final test accuracy: {final_test_acc:.2f}%")
+            print(f"Final val accuracy: {final_val_acc:.2f}%")
             print(f"Training successful: {training_successful}")
             
         except Exception as e:
             print(f"Error during training: {e}")
-            results['final_accuracies'].append(0.0)
-            results['final_losses'].append(float('inf'))
+            results['final_test_accuracies'].append(0.0)
+            results['final_val_accuracies'].append(0.0)
+            results['final_test_losses'].append(float('inf'))
+            results['final_val_losses'].append(float('inf'))
             results['training_successful'].append(False)
     
     return results
@@ -178,30 +198,41 @@ def plot_noise_boundary(results: Dict[str, Any], output_path: str):
     """
     noise_type = results['noise_type']
     noise_strengths = results['noise_strengths']
-    final_accuracies = results['final_accuracies']
+    # 使用test acc绘图（如果存在），否则使用val acc
+    final_test_accuracies = results.get('final_test_accuracies', [])
+    final_val_accuracies = results.get('final_val_accuracies', [])
+    # 向后兼容：如果新字段不存在，使用旧字段名
+    if not final_test_accuracies and 'final_accuracies' in results:
+        final_test_accuracies = results['final_accuracies']
+    if not final_val_accuracies:
+        final_val_accuracies = final_test_accuracies  # fallback
     training_successful = results['training_successful']
     
     # 创建图形
     fig, ax = plt.subplots(figsize=(10, 6))
     
-    # 绘制成功和失败的实验点
+    # 绘制成功和失败的实验点（使用test acc）
     successful_strengths = [s for s, success in zip(noise_strengths, training_successful) if success]
-    successful_accs = [a for a, success in zip(final_accuracies, training_successful) if success]
+    successful_test_accs = [a for a, success in zip(final_test_accuracies, training_successful) if success]
+    successful_val_accs = [a for a, success in zip(final_val_accuracies, training_successful) if success]
     failed_strengths = [s for s, success in zip(noise_strengths, training_successful) if not success]
-    failed_accs = [a for a, success in zip(final_accuracies, training_successful) if not success]
+    failed_test_accs = [a for a, success in zip(final_test_accuracies, training_successful) if not success]
     
-    # 绘制成功实验的曲线
+    # 绘制成功实验的test acc曲线
     if successful_strengths:
-        ax.plot(successful_strengths, successful_accs, 'o-', label='Training Successful', 
+        ax.plot(successful_strengths, successful_test_accs, 'o-', label='Test Accuracy', 
                 linewidth=2, markersize=8, color='blue')
+        # 同时绘制val acc曲线（虚线）
+        ax.plot(successful_strengths, successful_val_accs, 's--', label='Val Accuracy', 
+                linewidth=2, markersize=6, color='green', alpha=0.7)
     
     # 绘制失败实验的点
     if failed_strengths:
-        ax.scatter(failed_strengths, failed_accs, marker='x', s=100, color='red', 
+        ax.scatter(failed_strengths, failed_test_accs, marker='x', s=100, color='red', 
                   label='Training Failed', linewidths=2)
     
     ax.set_xlabel(f'{noise_type} (Noise Strength)', fontsize=12)
-    ax.set_ylabel('Final Validation Accuracy (%)', fontsize=12)
+    ax.set_ylabel('Final Accuracy (%)', fontsize=12)
     ax.set_title(f'Noise Boundary: {noise_type} vs Final Accuracy', fontsize=14, fontweight='bold')
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)

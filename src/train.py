@@ -34,7 +34,7 @@ def main(args=None):
         parser = argparse.ArgumentParser(description='Train memristor-aware neural network')
         parser.add_argument('--config', type=str, required=True, help='Path to config YAML file')
         parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
-        parser.add_argument('--compensation', type=str, default=None, choices=['hat', 'learned_mapping'],
+        parser.add_argument('--compensation', type=str, default=None, choices=['hat'],
                            help='Compensation method (overrides config)')
         parser.add_argument('--output-dir', type=str, default=None, help='Output directory (overrides config)')
         args = parser.parse_args()

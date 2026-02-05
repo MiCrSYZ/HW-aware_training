@@ -103,7 +103,7 @@ def load_checkpoint_smart(
                 raise ValueError("device_model is required when loading memristor-wrapped checkpoint")
         else:
             # 创建包装模型
-            wrapped_model = wrap_model_with_memristor(base_model, device_model, use_learned_mapping=False)
+            wrapped_model = wrap_model_with_memristor(base_model, device_model)
             wrapped_model = wrapped_model.to(device)
             
             # 加载checkpoint到包装模型

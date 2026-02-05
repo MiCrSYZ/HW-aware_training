@@ -79,6 +79,13 @@ class MemristorDeviceModel:
         enable_adc_during_training: bool = False,  # 是否在训练时启用ADC量化（默认False，因为ADC量化会导致梯度消失）
         adc_training_mode: str = 'ste',  # ADC训练模式：'ste'（使用Straight-Through Estimator）或'direct'（直接量化，梯度会消失）
         enable_ir_drop_paper_during_training: bool = False,  # 是否在训练时启用paper版IR-drop（默认False，因为可能导致梯度不稳定）
+        # 合成噪声参数（用于研究噪声可学习性条件）
+        synthetic_noise_type: str = 'none',  # 'none' | 'cond1_variance_bounded' | 'cond2_gradient_unbiased' | 'cond3_adc_direct' | 'full_variability'
+        # cond.1 方差有界噪声参数
+        cond1_alpha: float = 0.1,  # 方差有界噪声的缩放因子α
+        cond1_nu: float = 2.0,  # t分布的自由度ν (ν ≤ 2)
+        # cond.2 梯度无偏噪声参数
+        cond2_alpha: float = 0.1,  # 梯度无偏噪声的缩放因子α
     ):
         self.G_min = G_min
         self.G_max = G_max
@@ -145,7 +152,13 @@ class MemristorDeviceModel:
         self.adc_training_mode = adc_training_mode  # 'ste' or 'direct'
         self.enable_ir_drop_paper_during_training = enable_ir_drop_paper_during_training
         
-        # 存储 seed 用于生成固定的 stuck mask
+        # 合成噪声参数
+        self.synthetic_noise_type = synthetic_noise_type
+        self.cond1_alpha = cond1_alpha
+        self.cond1_nu = max(1.0, min(2.0, cond1_nu))  # 确保 ν ∈ [1, 2]
+        self.cond2_alpha = cond2_alpha
+        
+        # 存储 seed 用于生成固定的 stuck mask 和 cond.2 的随机向量
         self.seed = seed
         if seed is not None:
             torch.manual_seed(seed)
@@ -155,6 +168,9 @@ class MemristorDeviceModel:
         self._stuck_mask_shape = None
         self._stuck_low_mask = None
         self._stuck_high_mask = None
+        
+        # 存储 cond.2 的固定随机向量（按层形状缓存）
+        self._cond2_v_vectors: Dict[Tuple, torch.Tensor] = {}
     
     def map_weights_to_conductance(
         self, 
@@ -365,7 +381,7 @@ class MemristorDeviceModel:
                 # 累加模式：使用推理次数计数器（模拟真实器件老化）
                 drift_t = self.inference_count
             elif self.drift_time_mode == 'param':
-                # 参数模式：使用传入的t值（用于learned_mapping等需要控制t的场景）
+                # 参数模式：使用传入的t值
                 drift_t = t
             else:
                 # 默认：使用传入的t值（向后兼容）

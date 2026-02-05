@@ -163,6 +163,13 @@ def main(args=None):
             ir_drop_cap=float(ir_drop_cap),
             ir_drop_norm=str(ir_drop_norm),
             ir_drop_train_enabled=bool(ir_drop_train_enabled),
+            enable_adc_during_training=bool(memristor_config.get('enable_adc_during_training', False)),
+            adc_training_mode=str(memristor_config.get('adc_training_mode', 'ste')),
+            enable_ir_drop_paper_during_training=bool(memristor_config.get('enable_ir_drop_paper_during_training', False)),
+            synthetic_noise_type=str(memristor_config.get('synthetic_noise_type', 'none')),
+            cond1_alpha=float(memristor_config.get('cond1_alpha', 0.1)),
+            cond1_nu=float(memristor_config.get('cond1_nu', 2.0)),
+            cond2_alpha=float(memristor_config.get('cond2_alpha', 0.1)),
         )
         model = wrap_model_with_memristor(model, device_model)
     

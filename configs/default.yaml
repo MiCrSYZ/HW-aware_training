@@ -88,7 +88,7 @@ memristor:
 # Experiment mode configuration
 experiment:
   mode: baseline  # baseline, memristor_no_comp, or memristor_with_comp
-  compensation_method: hat  # hat or learned_mapping (only for memristor_with_comp)
+  compensation_method: hat  # hat (only for memristor_with_comp)
   energy_estimation: false
   energy_params:
     subarray_size: 128

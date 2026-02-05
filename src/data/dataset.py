@@ -14,6 +14,19 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _create_optimized_dataloader(dataset, batch_size, shuffle, num_workers):
+    """Create an optimized DataLoader with performance settings."""
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
+        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch batches for better GPU utilization
+    )
+
+
 def get_cifar10_dataloaders(
     data_root: str = './datasets/cifar-10',
     batch_size: int = 128,
@@ -88,32 +101,20 @@ def get_cifar10_dataloaders(
         transform=val_test_transform,
     )
     
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
+    # Create dataloaders with performance optimizations
+    train_loader = _create_optimized_dataloader(
+        train_dataset, batch_size, shuffle=True, num_workers=num_workers
     )
     
     if val_dataset is not None:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
+        val_loader = _create_optimized_dataloader(
+            val_dataset, batch_size, shuffle=False, num_workers=num_workers
         )
     else:
         val_loader = None
     
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
+    test_loader = _create_optimized_dataloader(
+        test_dataset, batch_size, shuffle=False, num_workers=num_workers
     )
     
     logger.info(
@@ -199,32 +200,20 @@ def get_cifar100_dataloaders(
         transform=val_test_transform,
     )
     
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
+    # Create dataloaders with performance optimizations
+    train_loader = _create_optimized_dataloader(
+        train_dataset, batch_size, shuffle=True, num_workers=num_workers
     )
     
     if val_dataset is not None:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
+        val_loader = _create_optimized_dataloader(
+            val_dataset, batch_size, shuffle=False, num_workers=num_workers
         )
     else:
         val_loader = None
     
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
+    test_loader = _create_optimized_dataloader(
+        test_dataset, batch_size, shuffle=False, num_workers=num_workers
     )
     
     logger.info(
@@ -308,32 +297,20 @@ def get_mnist_dataloaders(
         transform=val_test_transform,
     )
     
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
+    # Create dataloaders with performance optimizations
+    train_loader = _create_optimized_dataloader(
+        train_dataset, batch_size, shuffle=True, num_workers=num_workers
     )
     
     if val_dataset is not None:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
+        val_loader = _create_optimized_dataloader(
+            val_dataset, batch_size, shuffle=False, num_workers=num_workers
         )
     else:
         val_loader = None
     
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
+    test_loader = _create_optimized_dataloader(
+        test_dataset, batch_size, shuffle=False, num_workers=num_workers
     )
     
     logger.info(
@@ -417,7 +394,21 @@ def get_dataloaders(
             val_split=val_split,
             seed=seed,
         )
+    elif dataset_name.lower() == 'agnews':
+        # Import here to avoid circular dependency
+        from .agnews import get_agnews_dataloaders
+        train_loader, val_loader, test_loader, vocab = get_agnews_dataloaders(
+            data_root=data_root,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            val_split=val_split,
+            seed=seed,
+        )
+        # Return 4 values so caller can unpack (train_loader, val_loader, test_loader, vocab)
+        import sys
+        sys.modules[__name__]._agnews_vocab = vocab
+        return train_loader, val_loader, test_loader, vocab
     else:
-        raise ValueError(f"Unknown dataset: {dataset_name}. Available: 'cifar10', 'cifar100', 'mnist', 'tinyimagenet'")
+        raise ValueError(f"Unknown dataset: {dataset_name}. Available: 'cifar10', 'cifar100', 'mnist', 'tinyimagenet', 'agnews'")
 
 

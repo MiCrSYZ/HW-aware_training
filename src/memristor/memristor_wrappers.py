@@ -16,14 +16,34 @@ def hardware_linear_forward_adaptive(
     t: int = 0,
     seed: Optional[int] = None,
     training: bool = True,
+    enable_noise: bool = True,  # Control whether to inject noise
 ) -> tuple:
 
     # Map weights to differential conductances adaptively
     Gp, Gn, max_abs = device_model.map_weights_to_conductance_diff_adaptive(W)
 
     # Apply non-idealities separately (seed can be different or same depending on model)
-    Gp_noisy = device_model.apply_nonidealities(Gp, t=t, seed=seed)
-    Gn_noisy = device_model.apply_nonidealities(Gn, t=t, seed=(None if seed is None else seed+1))
+    # 对于合成噪声类型，需要根据类型决定是否应用非理想性
+    synthetic_noise_type = getattr(device_model, 'synthetic_noise_type', 'none')
+    # full_variability应该应用variability_sigma，即使enable_noise=False（因为它是通过synthetic_noise_type控制的）
+    # 但是，如果enable_noise=False且synthetic_noise_type='none'，则不应用任何噪声
+    if synthetic_noise_type == 'full_variability':
+        # full_variability总是应用variability_sigma（通过apply_nonidealities）
+        apply_nonidealities = True
+    elif synthetic_noise_type == 'none':
+        # none模式：只有当enable_noise=True时才应用非理想性（通过noise_injection配置控制）
+        apply_nonidealities = enable_noise
+    else:
+        # cond1/cond2/cond3模式：不应用传统的非理想性（variability_sigma等），只应用合成噪声
+        apply_nonidealities = False
+    
+    if apply_nonidealities:
+        Gp_noisy = device_model.apply_nonidealities(Gp, t=t, seed=seed)
+        Gn_noisy = device_model.apply_nonidealities(Gn, t=t, seed=(None if seed is None else seed+1))
+    else:
+        # No noise: use original conductances
+        Gp_noisy = Gp
+        Gn_noisy = Gn
 
     # Effective conductance difference (this is in conductance units, ~1e-6 to 1e-4)
     W_eff_conductance = Gp_noisy - Gn_noisy
@@ -37,6 +57,32 @@ def hardware_linear_forward_adaptive(
     scale = torch.clamp(scale, min=1e-3, max=1e6)
     # Convert effective conductance to effective weight
     W_eff = W_eff_conductance * scale
+
+    # Apply cond.1 方差有界噪声 (在权重上)
+    # W_eff = W ⊙ (1 + αε), where ε ~ t_ν, ν ≤ 2
+    # 注意：合成噪声独立于enable_noise，因为它不是通过noise_injection配置控制的
+    if hasattr(device_model, 'synthetic_noise_type') and device_model.synthetic_noise_type == 'cond1_variance_bounded':
+        nu = device_model.cond1_nu
+        # 使用PyTorch的StudentT分布生成t分布噪声
+        t_dist = torch.distributions.StudentT(df=nu)
+        if seed is not None:
+            # 设置随机种子（注意：StudentT.sample不支持generator参数，所以使用全局seed）
+            # 为了更好的可重复性，我们使用手动实现
+            generator = torch.Generator(device=W_eff.device)
+            generator.manual_seed(seed)
+            # t分布 = Z / sqrt(χ²/ν)，其中 Z ~ N(0,1), χ² ~ Gamma(ν/2, 2)
+            Z = torch.randn(W_eff.shape, generator=generator, device=W_eff.device, dtype=W_eff.dtype, requires_grad=False)
+            # 使用Gamma分布生成卡方分布: χ² ~ Gamma(ν/2, 2)
+            gamma_dist = torch.distributions.Gamma(concentration=nu / 2.0, rate=0.5)
+            chi2 = gamma_dist.sample(W_eff.shape).to(W_eff.device)
+            # 避免除零
+            chi2 = torch.clamp(chi2, min=1e-8)
+            t_noise = Z / torch.sqrt(chi2 / nu)
+        else:
+            t_noise = t_dist.sample(W_eff.shape).to(W_eff.device)
+        
+        alpha = device_model.cond1_alpha
+        W_eff = W_eff * (1.0 + alpha * t_noise)
 
     # Perform linear operation with effective weight
     # NOTE: All operations above maintain gradients - no detach() calls
@@ -55,46 +101,75 @@ def hardware_linear_forward_adaptive(
     else:
         out = F.linear(x, W_eff)
 
+    # Apply cond.2 梯度无偏噪声 (在输出上)
+    # Forward: z = Wx, s(z) = 1 + α*tanh(v^T z), z̃ = s(z) ⊙ z
+    # Backward: ∂z̃/∂W = detach(s(z)) · ∂z/∂W
+    # 注意：合成噪声独立于enable_noise，因为它不是通过noise_injection配置控制的
+    if hasattr(device_model, 'synthetic_noise_type') and device_model.synthetic_noise_type == 'cond2_gradient_unbiased':
+        # 获取或生成固定的随机向量 v
+        # v 的形状应该是 [out_features]，用于与输出 z 做内积
+        out_features = out.shape[-1]
+        v_key = (out_features,)
+        
+        if v_key not in device_model._cond2_v_vectors:
+            # 生成固定的随机向量 v（基于seed，不训练）
+            if device_model.seed is not None:
+                generator = torch.Generator(device=out.device)
+                # 使用不同的seed偏移来为不同层生成不同的v
+                generator.manual_seed(device_model.seed + hash(v_key) % 1000000)
+                v = torch.randn(out_features, generator=generator, device=out.device, dtype=out.dtype, requires_grad=False)
+            else:
+                v = torch.randn(out_features, device=out.device, dtype=out.dtype, requires_grad=False)
+            # 归一化 v
+            v = v / (torch.norm(v) + 1e-8)
+            device_model._cond2_v_vectors[v_key] = v
+        else:
+            v = device_model._cond2_v_vectors[v_key].to(out.device)
+        
+        # 计算 s(z) = 1 + α * tanh(v^T z)
+        # out shape: [batch, out_features] 或 [batch, num_patches, out_features]
+        # v shape: [out_features]
+        # 需要计算 v^T z，即对最后一个维度做内积
+        if out.dim() == 2:
+            # [batch, out_features]
+            vTz = torch.sum(out * v.unsqueeze(0), dim=-1, keepdim=True)  # [batch, 1]
+        else:
+            # [batch, num_patches, out_features] 或其他形状
+            vTz = torch.sum(out * v.view(1, -1), dim=-1, keepdim=True)  # [batch, num_patches, 1] 或类似
+        
+        alpha = device_model.cond2_alpha
+        s_z = 1.0 + alpha * torch.tanh(vTz)  # [batch, 1] 或 [batch, num_patches, 1]
+        
+        # Forward: z̃ = s(z) ⊙ z
+        # Backward: 使用 detach(s(z)) 来阻断梯度流
+        s_z_detached = s_z.detach()
+        out = out * s_z_detached + (out * s_z - out * s_z_detached).detach()
+
     # Final ADC quantization AFTER tile-sum
     # Apply ADC quantization if enabled and (inference OR training with enable_adc_during_training)
+    # Only apply ADC if noise is enabled (ADC is part of noise injection)
     
-    # Debug: always check and log ADC status (only once)
-    if training and not hasattr(device_model, '_adc_check_logged'):
-        has_enable_adc = hasattr(device_model, "enable_adc")
-        enable_adc_value = getattr(device_model, "enable_adc", None) if has_enable_adc else None
-        enable_adc_during_training_value = getattr(device_model, "enable_adc_during_training", None)
-        print(f"[DEBUG ADC CHECK] hasattr(enable_adc)={has_enable_adc}, enable_adc={enable_adc_value}, "
-              f"enable_adc_during_training={enable_adc_during_training_value}, training={training}")
-        device_model._adc_check_logged = True
-    
-    if hasattr(device_model, "enable_adc") and device_model.enable_adc:
+    # 对于cond3_adc_direct，需要强制启用ADC
+    # 初始化 enable_adc_during_training，避免在日志中引用未赋值变量
+    enable_adc_during_training = False
+    if synthetic_noise_type == 'cond3_adc_direct':
+        should_apply_adc = True  # cond3总是应用ADC
+    elif enable_noise and hasattr(device_model, "enable_adc") and device_model.enable_adc:
         enable_adc_during_training = getattr(device_model, "enable_adc_during_training", False)
         should_apply_adc = not training or enable_adc_during_training
-        
-        # Debug: print ADC status (only once per training session)
-        if training and not hasattr(device_model, '_adc_status_logged'):
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.info(f"ADC status check: enable_adc={device_model.enable_adc}, "
-                       f"enable_adc_during_training={enable_adc_during_training}, "
-                       f"training={training}, should_apply_adc={should_apply_adc}")
-            device_model._adc_status_logged = True
+    else:
+        should_apply_adc = False
+    
+    if should_apply_adc and hasattr(device_model, "enable_adc") and device_model.enable_adc:
         
         if should_apply_adc:
             if training:
                 # Training mode: choose between STE and direct quantization
-                adc_mode = getattr(device_model, 'adc_training_mode', 'direct')  # Default to 'ste' for backward compatibility（别给我默认ste）
+                adc_mode = getattr(device_model, 'adc_training_mode', 'direct')  # Default to 'direct' for backward compatibility
                 
-                # Debug: print mode (only once per training session to avoid spam)
-                if not hasattr(device_model, '_adc_mode_logged'):
-                    import logging
-                    logger = logging.getLogger(__name__)
-                    print(f"[DEBUG] ADC training mode: {adc_mode}")
-                    print(f"[DEBUG] enable_adc={device_model.enable_adc}, enable_adc_during_training={enable_adc_during_training}")
-                    logger.info(f"ADC training mode: {adc_mode} (enable_adc_during_training={enable_adc_during_training})")
-                    if adc_mode == 'direct':
-                        print("[WARNING] Direct mode: gradients will be completely blocked (detached), training may collapse!")
-                    device_model._adc_mode_logged = True
+                # 对于cond3_adc_direct，强制使用direct模式
+                if synthetic_noise_type == 'cond3_adc_direct':
+                    adc_mode = 'direct'
                 
                 if adc_mode == 'ste':
                     # Use straight-through estimator (STE): forward uses quantized value, backward uses identity
@@ -117,7 +192,8 @@ def hardware_linear_forward_adaptive(
 
     # Apply new IR-drop correction based on paper equations (16)-(18) if enabled
     # Apply IR-drop if enabled and (inference OR training with enable_ir_drop_paper_during_training)
-    if device_model.ir_drop_mode == "paper":
+    # Only apply IR-drop if noise is enabled (IR-drop is part of noise injection)
+    if enable_noise and device_model.ir_drop_mode == "paper":
         should_apply_ir = not training or (hasattr(device_model, "enable_ir_drop_paper_during_training") and device_model.enable_ir_drop_paper_during_training)
         if should_apply_ir:
             # Compute normalization factors with numerical stability protection
@@ -176,18 +252,20 @@ class MemristorLinear(nn.Module):
     and non-idealities are applied before computation.
     """
 
-    def __init__(self, linear: nn.Linear, device_model: MemristorDeviceModel):
+    def __init__(self, linear: nn.Linear, device_model: MemristorDeviceModel, enable_noise: bool = True):
         """
         Initialize memristor-aware linear layer.
 
         Args:
             linear: Standard nn.Linear layer to wrap
             device_model: MemristorDeviceModel instance
+            enable_noise: Whether to inject noise in this layer (default: True for backward compatibility)
         """
         super().__init__()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         self.device_model = device_model
+        self.enable_noise = enable_noise  # Control flag for noise injection
 
         # Copy weights and bias
         self.weight = nn.Parameter(linear.weight.data.clone())
@@ -208,7 +286,11 @@ class MemristorLinear(nn.Module):
         Returns:
             Output tensor [batch, out_features]
         """
-        out, _ = hardware_linear_forward_adaptive(x, self.weight, self.device_model, t=t, seed=seed, training=self.training)
+        out, _ = hardware_linear_forward_adaptive(
+            x, self.weight, self.device_model, 
+            t=t, seed=seed, training=self.training,
+            enable_noise=self.enable_noise
+        )
         if self.bias is not None:
             out = out + self.bias
         return out
@@ -224,16 +306,18 @@ class MemristorConv2d(nn.Module):
     weights, and folding back.
     """
 
-    def __init__(self, conv: nn.Conv2d, device_model: MemristorDeviceModel):
+    def __init__(self, conv: nn.Conv2d, device_model: MemristorDeviceModel, enable_noise: bool = True):
         """
         Initialize memristor-aware convolutional layer.
 
         Args:
             conv: Standard nn.Conv2d layer to wrap
             device_model: MemristorDeviceModel instance
+            enable_noise: Whether to inject noise in this layer (default: True for backward compatibility)
         """
         super().__init__()
         self.device_model = device_model
+        self.enable_noise = enable_noise  # Control flag for noise injection
 
         # Copy conv parameters
         self.in_channels = conv.in_channels
@@ -290,7 +374,8 @@ class MemristorConv2d(nn.Module):
         out_flat, _ = hardware_linear_forward_adaptive(
             x_flat, W_flat,
             self.device_model,
-            t=t, seed=seed, training=self.training
+            t=t, seed=seed, training=self.training,
+            enable_noise=self.enable_noise
         )
 
         # Transpose back: [batch, out_channels, num_patches]

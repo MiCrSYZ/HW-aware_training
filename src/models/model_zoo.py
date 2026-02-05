@@ -6,26 +6,22 @@ with memristor-aware layers.
 """
 
 import torch.nn as nn
-from typing import Optional
+from typing import Optional, Dict, Any
 
 try:
     from .resnet20 import ResNet20
     from .vit_tiny import ViTTiny
+    from .gru_agnews import GRUAGNews
     from ..memristor.memristor_wrappers import MemristorLinear, MemristorConv2d
+    from ..memristor.memristor_gru import MemristorGRU
     from ..memristor.device_model import MemristorDeviceModel
-    from ..memristor.learned_weight_mapping import (
-        MemristorLinear as LearnedMappingMemristorLinear,
-        MemristorConv2d as LearnedMappingMemristorConv2d
-    )
 except ImportError:
     from src.models.resnet20 import ResNet20
     from src.models.vit_tiny import ViTTiny
+    from src.models.gru_agnews import GRUAGNews
     from src.memristor.memristor_wrappers import MemristorLinear, MemristorConv2d
+    from src.memristor.memristor_gru import MemristorGRU
     from src.memristor.device_model import MemristorDeviceModel
-    from src.memristor.learned_weight_mapping import (
-        MemristorLinear as LearnedMappingMemristorLinear,
-        MemristorConv2d as LearnedMappingMemristorConv2d
-    )
 
 
 def get_model(
@@ -37,10 +33,14 @@ def get_model(
     Get a model by name.
     
     Args:
-        name: Model name ('resnet20' or 'vit_tiny')
+        name: Model name ('resnet20', 'vit_tiny', or 'gru_agnews')
         num_classes: Number of output classes
         **kwargs: Additional model-specific arguments
             - in_channels: Input channels (for ResNet20, default: 3 for RGB, 1 for grayscale)
+            - vocab_size: Vocabulary size (for GRU, required)
+            - embed_dim: Embedding dimension (for GRU, default: 128)
+            - hidden_dim: Hidden dimension (for GRU, default: 256)
+            - num_layers: Number of layers (for GRU, default: 2)
         
     Returns:
         Model instance
@@ -50,15 +50,85 @@ def get_model(
         return ResNet20(num_classes=num_classes, in_channels=in_channels)
     elif name == 'vit_tiny':
         return ViTTiny(num_classes=num_classes, **kwargs)
+    elif name == 'gru_agnews':
+        vocab_size = kwargs.get('vocab_size', None)
+        if vocab_size is None:
+            raise ValueError("vocab_size is required for GRU model")
+        embed_dim = kwargs.get('embed_dim', 128)
+        hidden_dim = kwargs.get('hidden_dim', 256)
+        num_layers = kwargs.get('num_layers', 2)
+        return GRUAGNews(
+            vocab_size=vocab_size,
+            embed_dim=embed_dim,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_classes=num_classes,
+        )
     else:
-        raise ValueError(f"Unknown model: {name}. Available: 'resnet20', 'vit_tiny'")
+        raise ValueError(f"Unknown model: {name}. Available: 'resnet20', 'vit_tiny', 'gru_agnews'")
+
+
+def _should_inject_noise_for_layer(
+    full_name: str,
+    layer_type: str,  # 'linear' or 'conv2d'
+    noise_config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """
+    Determine if noise should be injected for a given layer based on configuration.
+    
+    Args:
+        full_name: Full layer name (e.g., 'patch_embed.proj', 'blocks.0.attn.qkv')
+        layer_type: Type of layer ('linear' or 'conv2d')
+        noise_config: Noise injection configuration from config file
+        
+    Returns:
+        True if noise should be injected, False otherwise
+    """
+    # If no noise config provided, default to injecting noise everywhere (backward compatibility)
+    if noise_config is None:
+        return True
+    
+    # Check patch_embed (Conv2d)
+    if 'patch_embed' in full_name and layer_type == 'conv2d':
+        patch_config = noise_config.get('patch_embed', {})
+        # If patch_embed config exists, check enable_ir_drop (IR-drop is the main noise for MVM)
+        if patch_config:
+            return patch_config.get('enable_ir_drop', True)
+        return True  # Default to True if config section exists but key missing
+    
+    # Check attention layers (Linear)
+    if 'attn' in full_name and layer_type == 'linear':
+        attn_config = noise_config.get('attn', {})
+        if attn_config:
+            # Check specific attention layer types
+            if 'qkv' in full_name:
+                # Q/K/V projection: check enable_adc_qkv (ADC量化对Q/K/V的输出)
+                return attn_config.get('enable_adc_qkv', True)
+            elif 'proj' in full_name:
+                # Output projection (W_o): check enable_ir_drop_w_o (IR-drop优先注入到W_o)
+                return attn_config.get('enable_ir_drop_w_o', True)
+            else:
+                # Other attention layers: default to False (only qkv and proj should have noise)
+                return False
+        return True  # Default to True if config section exists but key missing
+    
+    # Check MLP layers (Linear)
+    if 'mlp' in full_name and layer_type == 'linear':
+        mlp_config = noise_config.get('mlp', {})
+        if mlp_config:
+            # Check enable_ir_drop for MLP layers
+            return mlp_config.get('enable_ir_drop', True)
+        return True  # Default to True if config section exists but key missing
+    
+    # For other layers (e.g., head), default to False (no noise injection)
+    # This ensures only A, B, C locations get noise by default
+    return False
 
 
 def wrap_model_with_memristor(
     model: nn.Module,
     device_model: MemristorDeviceModel,
-    use_learned_mapping: bool = False,
-    mapping_max_frac: float = 0.5,
+    noise_config: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
     """
     Wrap a model's layers with memristor-aware versions.
@@ -69,60 +139,76 @@ def wrap_model_with_memristor(
     Args:
         model: Base model to wrap
         device_model: MemristorDeviceModel instance
-        use_learned_mapping: If True, use learned_weight_mapping.py classes that support mapping_net
-        mapping_max_frac: Max fraction for delta clamping in learned mapping (default: 0.5)
+        noise_config: Optional noise injection configuration dict from config file.
+                     If None, all layers will have noise injected (backward compatibility).
+                     Structure: {
+                         'patch_embed': {'enable_ir_drop': bool, 'enable_adc': bool},
+                         'attn': {'enable_adc_qkv': bool, 'enable_ir_drop_w_o': bool, 'enable_ir_drop_w_v': bool},
+                         'mlp': {'enable_ir_drop': bool, 'enable_adc': bool}
+                     }
         
     Returns:
         Model with memristor-aware layers
     """
-    # Select which classes to use based on use_learned_mapping flag
-    if use_learned_mapping:
-        MemristorLinearCls = LearnedMappingMemristorLinear
-        MemristorConv2dCls = LearnedMappingMemristorConv2d
-    else:
-        MemristorLinearCls = MemristorLinear
-        MemristorConv2dCls = MemristorConv2d
+    MemristorLinearCls = MemristorLinear
+    MemristorConv2dCls = MemristorConv2d
     
-    def _replace_in_module(module):
+    # Check if model is GRU-based
+    is_gru_model = False
+    for module in model.modules():
+        if isinstance(module, nn.GRU):
+            is_gru_model = True
+            break
+    
+    def _replace_in_module(module, parent_name=''):
         """
-        Recursively replace Linear and Conv2d layers with memristor versions.
+        Recursively replace Linear, Conv2d, and GRU layers with memristor versions.
         
-        This function modifies the module in-place by replacing its Linear/Conv2d
-        children with MemristorLinear/MemristorConv2d equivalents.
+        This function modifies the module in-place by replacing its Linear/Conv2d/GRU
+        children with MemristorLinear/MemristorConv2d/MemristorGRU equivalents.
         
         Args:
             module: Module to process (will be modified in-place)
+            parent_name: Full name of parent module (for building full layer names)
         """
         # Get all direct children (not recursive)
         for name, child in list(module.named_children()):
+            # Build full name for this layer
+            full_name = f"{parent_name}.{name}" if parent_name else name
+            
             if isinstance(child, nn.Linear):
+                # Determine if noise should be injected for this layer
+                enable_noise = _should_inject_noise_for_layer(full_name, 'linear', noise_config)
                 # Replace Linear layer
-                if use_learned_mapping:
-                    setattr(module, name, MemristorLinearCls(child, device_model, mapping_max_frac=mapping_max_frac))
-                else:
-                    setattr(module, name, MemristorLinearCls(child, device_model))
+                setattr(module, name, MemristorLinearCls(child, device_model, enable_noise=enable_noise))
             elif isinstance(child, nn.Conv2d):
+                # Determine if noise should be injected for this layer
+                enable_noise = _should_inject_noise_for_layer(full_name, 'conv2d', noise_config)
                 # Replace Conv2d layer
-                if use_learned_mapping:
-                    setattr(module, name, MemristorConv2dCls(child, device_model, mapping_max_frac=mapping_max_frac))
-                else:
-                    setattr(module, name, MemristorConv2dCls(child, device_model))
+                setattr(module, name, MemristorConv2dCls(child, device_model, enable_noise=enable_noise))
+            elif isinstance(child, nn.GRU):
+                # For GRU, always enable both weight and output noise
+                # The noise_config can control which types are applied via device_model.synthetic_noise_type
+                enable_weight_noise = True
+                enable_output_noise = True
+                # Replace GRU layer
+                setattr(module, name, MemristorGRU(child, device_model, enable_weight_noise, enable_output_noise))
             else:
                 # Recursively process child modules (Sequential, ModuleList, BasicBlock, etc.)
-                _replace_in_module(child)
-    
-    # Create a wrapper class to maintain model structure
+                _replace_in_module(child, full_name)
+
+    # In-place replace: modify the given model so we only have one copy of parameters.
+    # This avoids deepcopy cost and double memory; base_model and memristor_model.base_model
+    # become the same object, so no_comp training is fast and sync is a no-op when needed.
+    _replace_in_module(model, parent_name='')
+
     class MemristorModel(nn.Module):
         def __init__(self, base_model, device_model):
             super().__init__()
             self.device_model = device_model
-            # Clone the model structure
-            import copy
-            self.base_model = copy.deepcopy(base_model)
-            # Recursively replace all Linear and Conv2d layers
-            _replace_in_module(self.base_model)
+            self.base_model = base_model  # same reference (already in-place replaced above)
         
-        def forward(self, x, t=0, seed=None, enable_sanity_check=False):
+        def forward(self, x, t=0, seed=None, enable_sanity_check=False, lengths=None):
             # Forward with time parameter and enable_sanity_check
             # Use a counter to only print from the first memristor layer
             self._sanity_check_counter = [0]  # Use list to allow modification in nested calls
@@ -146,38 +232,54 @@ def wrap_model_with_memristor(
                 print(f"Total layers with mapping_net: {mapping_net_count}")
                 print("=" * 60 + "\n")
             
-            return self._forward_with_t(self.base_model, x, t, seed, enable_sanity_check, self._sanity_check_counter)
+            return self._forward_with_t(self.base_model, x, t, seed, enable_sanity_check, self._sanity_check_counter, lengths=lengths)
         
-        def _forward_with_t(self, module, x, t, seed, enable_sanity_check=False, sanity_check_counter=None):
+        def _forward_with_t(self, module, x, t, seed, enable_sanity_check=False, sanity_check_counter=None, lengths=None):
             """Recursively forward with t parameter and enable_sanity_check where supported."""
             if sanity_check_counter is None:
                 sanity_check_counter = [0]
             
-            # Check for both standard and learned mapping memristor layers
-            is_memristor_linear = isinstance(module, (MemristorLinear, LearnedMappingMemristorLinear))
-            is_memristor_conv2d = isinstance(module, (MemristorConv2d, LearnedMappingMemristorConv2d))
+            # Check for memristor layers
+            is_memristor_linear = isinstance(module, MemristorLinear)
+            is_memristor_conv2d = isinstance(module, MemristorConv2d)
+            is_memristor_gru = isinstance(module, MemristorGRU)
             if is_memristor_linear or is_memristor_conv2d:
                 # Only enable sanity check for the first memristor layer to avoid too much output
                 check_this_layer = enable_sanity_check and (sanity_check_counter[0] == 0)
                 if check_this_layer:
                     sanity_check_counter[0] += 1
                 return module(x, t=t, seed=seed, enable_sanity_check=check_this_layer)
+            elif is_memristor_gru:
+                # GRU forward with t, seed, and lengths
+                return module(x, hx=None, t=t, seed=seed)
             elif isinstance(module, nn.Sequential):
                 for m in module:
-                    x = self._forward_with_t(m, x, t, seed, enable_sanity_check, sanity_check_counter)
+                    x = self._forward_with_t(m, x, t, seed, enable_sanity_check, sanity_check_counter, lengths=lengths)
                 return x
             elif isinstance(module, nn.ModuleList):
                 for m in module:
-                    x = self._forward_with_t(m, x, t, seed, enable_sanity_check, sanity_check_counter)
+                    x = self._forward_with_t(m, x, t, seed, enable_sanity_check, sanity_check_counter, lengths=lengths)
                 return x
             else:
-                # For other modules, try to forward with t if supported
-                if hasattr(module, 'forward') and 't' in module.forward.__code__.co_varnames:
-                    # Check if it also supports enable_sanity_check
-                    if 'enable_sanity_check' in module.forward.__code__.co_varnames:
-                        return module(x, t=t, seed=seed, enable_sanity_check=enable_sanity_check)
+                # For other modules (like GRUAGNews), try to forward with lengths if supported
+                if hasattr(module, 'forward'):
+                    forward_code = module.forward.__code__
+                    forward_varnames = forward_code.co_varnames
+                    # Check if forward supports lengths parameter
+                    if 'lengths' in forward_varnames:
+                        # Check if it also supports t parameter
+                        if 't' in forward_varnames:
+                            return module(x, lengths=lengths, t=t, seed=seed)
+                        else:
+                            return module(x, lengths=lengths)
+                    elif 't' in forward_varnames:
+                        # Check if it also supports enable_sanity_check
+                        if 'enable_sanity_check' in forward_varnames:
+                            return module(x, t=t, seed=seed, enable_sanity_check=enable_sanity_check)
+                        else:
+                            return module(x, t=t, seed=seed)
                     else:
-                        return module(x, t=t, seed=seed)
+                        return module(x)
                 else:
                     return module(x)
     

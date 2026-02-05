@@ -16,14 +16,31 @@ try:
     from ..memristor.compensation import (
         hardware_aware_training,
     )
-    from ..memristor.learned_weight_mapping import (
-        WeightMappingNet,
-        train_weight_mapping,
-    )
     from ..memristor.energy_estimator import EnergyEstimator
     from ..utils.metrics import AverageMeter, accuracy
     from ..utils.checkpoint import save_checkpoint, load_checkpoint
     from ..utils.logger import setup_logger, setup_tensorboard, setup_wandb
+    from ..utils.vit_metrics import (
+        collect_gradient_norms_by_tier,
+        collect_activation_stats,
+        compute_logit_margin,
+        register_activation_hooks,
+        compute_update_norm_by_tier,
+    )
+    try:
+        from ..utils.gru_metrics import (
+            collect_gradient_norms_by_tier as gru_collect_gradient_norms_by_tier,
+            collect_activation_stats as gru_collect_activation_stats,
+            compute_logit_margin as gru_compute_logit_margin,
+            register_activation_hooks as gru_register_activation_hooks,
+            compute_update_norm_by_tier as gru_compute_update_norm_by_tier,
+        )
+    except ImportError:
+        gru_collect_gradient_norms_by_tier = None
+        gru_collect_activation_stats = None
+        gru_compute_logit_margin = None
+        gru_register_activation_hooks = None
+        gru_compute_update_norm_by_tier = None
 except ImportError:
     import sys
     import os
@@ -33,16 +50,60 @@ except ImportError:
     from src.memristor.compensation import (
         hardware_aware_training,
     )
-    from src.memristor.learned_weight_mapping import (
-        WeightMappingNet,
-        train_weight_mapping,
-    )
     from src.memristor.energy_estimator import EnergyEstimator
     from src.utils.metrics import AverageMeter, accuracy
     from src.utils.checkpoint import save_checkpoint, load_checkpoint
     from src.utils.logger import setup_logger, setup_tensorboard, setup_wandb
+    try:
+        from src.utils.vit_metrics import (
+            collect_gradient_norms_by_tier,
+            collect_activation_stats,
+            compute_logit_margin,
+            register_activation_hooks,
+            compute_update_norm_by_tier,
+        )
+    except ImportError:
+        # ViT metrics not available, set to None
+        collect_gradient_norms_by_tier = None
+        collect_activation_stats = None
+        compute_logit_margin = None
+        register_activation_hooks = None
+        compute_update_norm_by_tier = None
+    try:
+        from src.utils.gru_metrics import (
+            collect_gradient_norms_by_tier as gru_collect_gradient_norms_by_tier,
+            collect_activation_stats as gru_collect_activation_stats,
+            compute_logit_margin as gru_compute_logit_margin,
+            register_activation_hooks as gru_register_activation_hooks,
+            compute_update_norm_by_tier as gru_compute_update_norm_by_tier,
+        )
+    except ImportError:
+        gru_collect_gradient_norms_by_tier = None
+        gru_collect_activation_stats = None
+        gru_compute_logit_margin = None
+        gru_register_activation_hooks = None
+        gru_compute_update_norm_by_tier = None
 
 logger = logging.getLogger(__name__)
+
+
+def _unpack_batch(batch, is_agnews=False):
+    """
+    Unpack batch data, handling both image datasets and AG News.
+    
+    Args:
+        batch: Batch from dataloader
+        is_agnews: Whether this is AG News dataset (returns labels, texts, lengths)
+        
+    Returns:
+        Tuple of (data, target, lengths) where lengths is None for non-text datasets
+    """
+    if is_agnews:
+        labels, texts, lengths = batch
+        return texts, labels, lengths
+    else:
+        data, target = batch
+        return data, target, None
 
 
 def compute_boundary_regularization(
@@ -139,6 +200,14 @@ def run_experiment(
     device = torch.device(config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
     experiment_logger.info(f"Using device: {device}")
     
+    # Performance optimizations for CUDA
+    if device.type == 'cuda':
+        # Enable cuDNN benchmark for faster convolutions (finds optimal algorithms)
+        torch.backends.cudnn.benchmark = True
+        # Disable deterministic mode for better performance (if reproducibility not critical)
+        # torch.backends.cudnn.deterministic = False  # Uncomment if you don't need exact reproducibility
+        experiment_logger.info("CUDA optimizations enabled: cudnn.benchmark=True")
+    
     # Data loaders
     try:
         from ..data.dataset import get_dataloaders
@@ -147,6 +216,7 @@ def run_experiment(
     
     # Determine input channels and num_classes based on dataset BEFORE loading data
     dataset_name = config['dataset'].lower()
+    vocab = None  # For text datasets
     if dataset_name == 'mnist':
         in_channels = 1  # Grayscale
         num_classes = config.get('num_classes', 10)
@@ -156,20 +226,33 @@ def run_experiment(
     elif dataset_name == 'cifar100':
         in_channels = 3  # RGB
         num_classes = config.get('num_classes', 100)
+    elif dataset_name == 'agnews':
+        num_classes = config.get('num_classes', 4)
+        # AG News returns vocab as 4th element
+        train_loader, val_loader, test_loader, vocab = get_dataloaders(
+            dataset_name=config['dataset'],
+            data_root=config['data_root'],
+            batch_size=config['batch_size'],
+            num_workers=config.get('num_workers', 4),
+            val_split=config.get('val_split', 0.1),
+            seed=config.get('seed'),
+        )
+        experiment_logger.info(f"AG News vocabulary size: {len(vocab)}")
     else:
         in_channels = config.get('in_channels', 3)  # Default to RGB
         num_classes = config.get('num_classes', 10)  # Default to 10
     
-    experiment_logger.info(f"Dataset: {dataset_name}, num_classes: {num_classes}, in_channels: {in_channels}")
+    experiment_logger.info(f"Dataset: {dataset_name}, num_classes: {num_classes}, in_channels: {in_channels if dataset_name != 'agnews' else 'N/A'}")
     
-    train_loader, val_loader, test_loader = get_dataloaders(
-        dataset_name=config['dataset'],
-        data_root=config['data_root'],
-        batch_size=config['batch_size'],
-        num_workers=config.get('num_workers', 4),
-        val_split=config.get('val_split', 0.1),
-        seed=config.get('seed'),
-    )
+    if dataset_name != 'agnews':
+        train_loader, val_loader, test_loader = get_dataloaders(
+            dataset_name=config['dataset'],
+            data_root=config['data_root'],
+            batch_size=config['batch_size'],
+            num_workers=config.get('num_workers', 4),
+            val_split=config.get('val_split', 0.1),
+            seed=config.get('seed'),
+        )
     
     # Validate label ranges in the dataset
     # This helps catch configuration errors early
@@ -179,9 +262,11 @@ def run_experiment(
     sample_count = 0
     
     # Check a few batches from train_loader
-    for batch_idx, (data, target) in enumerate(train_loader):
+    is_agnews = (dataset_name == 'agnews')
+    for batch_idx, batch in enumerate(train_loader):
         if batch_idx >= 5:  # Check first 5 batches
             break
+        data, target, lengths = _unpack_batch(batch, is_agnews=is_agnews)
         batch_max = target.max().item()
         batch_min = target.min().item()
         max_label = max(max_label, batch_max)
@@ -201,13 +286,41 @@ def run_experiment(
         raise ValueError(error_msg)
     
     # Model
+    # Extract model-specific parameters from config
+    model_kwargs = {}
+    if config['model_name'] == 'vit_tiny':
+        # ViT-specific parameters
+        model_kwargs['patch_size'] = config.get('patch_size', 4)
+        model_kwargs['embed_dim'] = config.get('embed_dim', 192)
+        model_kwargs['depth'] = config.get('depth', 6)
+        model_kwargs['num_heads'] = config.get('num_heads', 3)
+        model_kwargs['mlp_ratio'] = config.get('mlp_ratio', 4.0)
+        model_kwargs['qkv_bias'] = config.get('qkv_bias', False)
+    elif config['model_name'] == 'gru_agnews':
+        # GRU-specific parameters
+        if vocab is None:
+            raise ValueError("vocab is required for GRU model but not found")
+        model_kwargs['vocab_size'] = len(vocab)
+        model_kwargs['embed_dim'] = config.get('embed_dim', 128)
+        model_kwargs['hidden_dim'] = config.get('hidden_dim', 256)
+        model_kwargs['num_layers'] = config.get('num_layers', 2)
     
     base_model = get_model(
         name=config['model_name'],
         num_classes=num_classes,
-        in_channels=in_channels,
+        in_channels=in_channels if dataset_name != 'agnews' else None,
+        **model_kwargs
     )
     base_model = base_model.to(device)
+    
+    # Compile model for faster training (PyTorch 2.0+)
+    use_compile = config.get('use_torch_compile', False)
+    if use_compile and hasattr(torch, 'compile'):
+        try:
+            base_model = torch.compile(base_model, mode='reduce-overhead')
+            experiment_logger.info("Model compiled with torch.compile (PyTorch 2.0+)")
+        except Exception as e:
+            experiment_logger.warning(f"torch.compile failed: {e}, continuing without compilation")
     
     # Device model (for memristor experiments)
     device_model = None
@@ -316,40 +429,50 @@ def run_experiment(
             enable_adc_during_training=bool(memristor_config.get('enable_adc_during_training', False)),
             adc_training_mode=str(memristor_config.get('adc_training_mode', 'ste')),  # Default to 'ste' for backward compatibility
             enable_ir_drop_paper_during_training=bool(memristor_config.get('enable_ir_drop_paper_during_training', False)),
+            # 合成噪声参数（从配置传入，否则合成噪声永远不会生效）
+            synthetic_noise_type=str(memristor_config.get('synthetic_noise_type', 'none')),
+            cond1_alpha=float(memristor_config.get('cond1_alpha', 0.1)),
+            cond1_nu=float(memristor_config.get('cond1_nu', 2.0)),
+            cond2_alpha=float(memristor_config.get('cond2_alpha', 0.1)),
         )
         
-        # Log ADC training mode for debugging
+        # Log ADC training mode and synthetic noise for debugging
         adc_mode_from_config = memristor_config.get('adc_training_mode', None)
         print(f"[DEBUG CONFIG] adc_training_mode from config: {adc_mode_from_config}")
         print(f"[DEBUG CONFIG] adc_training_mode in device_model: {device_model.adc_training_mode}")
+        synthetic_type = getattr(device_model, 'synthetic_noise_type', 'none')
+        if synthetic_type != 'none':
+            experiment_logger.info(
+                f"Synthetic noise: type={synthetic_type}, cond1_alpha={device_model.cond1_alpha}, "
+                f"cond1_nu={device_model.cond1_nu}, cond2_alpha={device_model.cond2_alpha}"
+            )
+            print(f"[DEBUG CONFIG] synthetic_noise_type={synthetic_type} (cond1_alpha={device_model.cond1_alpha}, cond2_alpha={device_model.cond2_alpha})")
         if device_model.enable_adc_during_training:
             logger.info(f"ADC training enabled with mode: {device_model.adc_training_mode}")
             print(f"[DEBUG] Device model ADC settings: enable_adc={device_model.enable_adc}, "
                   f"enable_adc_during_training={device_model.enable_adc_during_training}, "
                   f"adc_training_mode={device_model.adc_training_mode}")
         
-        # Check if learned mapping is used
-        compensation_method = config['experiment'].get('compensation_method', 'hat')
-        use_learned_mapping = (compensation_method == 'learned_mapping')
-        
-        # Get mapping parameters from config
-        mapping_max_frac = float(config['experiment'].get('mapping_max_frac', 0.5))
-        
         # Create memristor-wrapped model for evaluation
-        # Use learned mapping classes if compensation_method is learned_mapping or hybrid
+        # Extract noise injection configuration if available
+        noise_config = None
+        if 'memristor' in config and 'noise_injection' in config['memristor']:
+            noise_config = config['memristor']['noise_injection']
+        
         memristor_model = wrap_model_with_memristor(
-            base_model, device_model, 
-            use_learned_mapping=use_learned_mapping,
-            mapping_max_frac=mapping_max_frac
+            base_model, device_model, noise_config=noise_config
         )
         memristor_model = memristor_model.to(device)
         
-        # For memristor_with_comp (HAT), use memristor model for training
-        # For memristor_no_comp, use base model for training, memristor model for eval
+        # For memristor_with_comp (HAT), use memristor model for training (with noise + compensation)
+        # For memristor_no_comp, ALWAYS use base model for training (no noise during training),
+        # and use memristor model only for evaluation/testing (noise injected at inference time)
         if config['experiment']['mode'] == 'memristor_with_comp':
             model = memristor_model
         else:  # memristor_no_comp
+            # no_comp: train clean (base_model), eval with noise (memristor_model)
             model = base_model
+            experiment_logger.info("memristor_no_comp mode: using base_model for training (no noise), memristor_model for eval/test (with noise)")
     else:  # baseline
         model = base_model
         # baseline模式不需要写入参数，设置默认值
@@ -361,6 +484,31 @@ def run_experiment(
     
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
+    
+    # Mixed precision training setup
+    use_amp = config.get('mixed_precision', False)  # Default to False for backward compatibility
+    if isinstance(use_amp, str):
+        # Support 'fp16', 'bf16', 'true', 'false'
+        use_amp = use_amp.lower() in ['fp16', 'bf16', 'true', '1']
+    amp_dtype = None
+    if use_amp:
+        if torch.cuda.is_available():
+            # Check if bfloat16 is supported (Ampere+ GPUs)
+            if hasattr(torch.cuda, 'is_bf16_supported') and torch.cuda.is_bf16_supported():
+                # Prefer bfloat16 for better numerical stability
+                amp_dtype = torch.bfloat16
+                experiment_logger.info("Using mixed precision training with bfloat16")
+            else:
+                amp_dtype = torch.float16
+                experiment_logger.info("Using mixed precision training with float16")
+        else:
+            experiment_logger.warning("Mixed precision requested but CUDA not available, using FP32")
+            use_amp = False
+    
+    scaler = None
+    if use_amp:
+        scaler = torch.amp.GradScaler('cuda')
+    
     optimizer_config = config['optimizer']
     if optimizer_config['type'] == 'sgd':
         optimizer = optim.SGD(
@@ -375,8 +523,22 @@ def run_experiment(
             lr=float(optimizer_config['lr']),
             weight_decay=float(optimizer_config.get('weight_decay', 1e-4)),
         )
+    elif optimizer_config['type'] == 'adamw':
+        # AdamW uses decoupled weight decay (better for transformers)
+        betas_config = optimizer_config.get('betas', [0.9, 0.999])
+        if isinstance(betas_config, list):
+            betas = tuple(betas_config)
+        else:
+            betas = betas_config
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=float(optimizer_config['lr']),
+            weight_decay=float(optimizer_config.get('weight_decay', 0.01)),
+            betas=betas,
+            eps=float(optimizer_config.get('eps', 1e-8)),
+        )
     else:
-        raise ValueError(f"Unknown optimizer: {optimizer_config['type']}")
+        raise ValueError(f"Unknown optimizer: {optimizer_config['type']}. Available: 'sgd', 'adam', 'adamw'")
     
     # Scheduler
     scheduler = None
@@ -392,17 +554,90 @@ def run_experiment(
     
     if 'scheduler' in config and config['scheduler']:
         scheduler_config = config['scheduler']
-        if scheduler_config['type'] == 'cosine':
-            scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=int(epochs),
-            )
-        elif scheduler_config['type'] == 'step':
-            scheduler = optim.lr_scheduler.StepLR(
-                optimizer,
-                step_size=int(scheduler_config.get('step_size', 30)),
-                gamma=float(scheduler_config.get('gamma', 0.1)),
-            )
+        scheduler_type = scheduler_config['type']
+        
+        # Check if warmup is enabled
+        warmup_epochs = scheduler_config.get('warmup_epochs', 0)
+        
+        if scheduler_type == 'cosine':
+            if warmup_epochs > 0:
+                # Use warmup + cosine annealing
+                # Try to use SequentialLR if available (PyTorch 1.13+), otherwise use LambdaLR
+                try:
+                    from torch.optim.lr_scheduler import SequentialLR, LinearLR
+                    warmup_scheduler = LinearLR(
+                        optimizer,
+                        start_factor=0.01,  # Start from 1% of base LR
+                        end_factor=1.0,
+                        total_iters=warmup_epochs,
+                    )
+                    cosine_T_max = max(1, int(epochs - warmup_epochs))
+                    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                        optimizer,
+                        T_max=cosine_T_max,
+                    )
+                    scheduler = SequentialLR(
+                        optimizer,
+                        schedulers=[warmup_scheduler, cosine_scheduler],
+                        milestones=[warmup_epochs],
+                    )
+                except ImportError:
+                    # Fallback for PyTorch < 1.13: use LambdaLR for warmup
+                    def lr_lambda(epoch):
+                        if epoch < warmup_epochs:
+                            # Linear warmup from 0.01 to 1.0
+                            return 0.01 + (1.0 - 0.01) * epoch / warmup_epochs
+                        else:
+                            # Cosine annealing after warmup
+                            cosine_epoch = epoch - warmup_epochs
+                            cosine_T_max = max(1, epochs - warmup_epochs)
+                            return 0.5 * (1 + math.cos(math.pi * cosine_epoch / cosine_T_max))
+                    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            else:
+                scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=max(1, int(epochs)),
+                )
+        elif scheduler_type == 'step':
+            if warmup_epochs > 0:
+                # Use warmup + step decay
+                try:
+                    from torch.optim.lr_scheduler import SequentialLR, LinearLR
+                    warmup_scheduler = LinearLR(
+                        optimizer,
+                        start_factor=0.01,
+                        end_factor=1.0,
+                        total_iters=warmup_epochs,
+                    )
+                    step_scheduler = optim.lr_scheduler.StepLR(
+                        optimizer,
+                        step_size=int(scheduler_config.get('step_size', 30)),
+                        gamma=float(scheduler_config.get('gamma', 0.1)),
+                    )
+                    scheduler = SequentialLR(
+                        optimizer,
+                        schedulers=[warmup_scheduler, step_scheduler],
+                        milestones=[warmup_epochs],
+                    )
+                except ImportError:
+                    # Fallback for PyTorch < 1.13: use LambdaLR for warmup
+                    step_size = int(scheduler_config.get('step_size', 30))
+                    gamma = float(scheduler_config.get('gamma', 0.1))
+                    def lr_lambda(epoch):
+                        if epoch < warmup_epochs:
+                            # Linear warmup from 0.01 to 1.0
+                            return 0.01 + (1.0 - 0.01) * epoch / warmup_epochs
+                        else:
+                            # Step decay after warmup
+                            step_epoch = epoch - warmup_epochs
+                            return gamma ** (step_epoch // step_size)
+                    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            else:
+                scheduler = optim.lr_scheduler.StepLR(
+                    optimizer,
+                    step_size=int(scheduler_config.get('step_size', 30)),
+                    gamma=float(scheduler_config.get('gamma', 0.1)),
+                )
     
     # Resume from checkpoint
     start_epoch = 0
@@ -426,11 +661,6 @@ def run_experiment(
     experiment_mode = config['experiment']['mode']
     metrics_history = []
     
-    # Check if post_train is enabled for learned_mapping
-    post_train_config = config['experiment'].get('post_train', {})
-    use_post_train = (experiment_mode == 'memristor_with_comp' and 
-                     config['experiment'].get('compensation_method') == 'learned_mapping' and
-                     post_train_config.get('enabled', False))
     
     # Time tracking for ETA calculation
     epoch_times = []
@@ -442,56 +672,49 @@ def run_experiment(
     
     for epoch in range(start_epoch, epochs):
         epoch_start_time = time.time()
-        experiment_logger.info(f"Epoch {epoch}/{epochs-1} starting...")
+        #experiment_logger.info(f"Epoch {epoch}/{epochs-1} starting...")
         
         # 重置能耗统计（如果启用，每个epoch开始时重置）
         if device_model and hasattr(device_model, 'enable_energy') and device_model.enable_energy:
             device_model.reset_energy_stats()
         
+        # Determine if GRU model
+        is_gru = (config['model_name'] == 'gru_agnews')
+        
         # Train
         if experiment_mode == 'baseline':
             train_metrics = _train_baseline(
-                model, train_loader, criterion, optimizer, device, epoch
+                model, train_loader, criterion, optimizer, device, epoch,
+                scaler=scaler, amp_dtype=amp_dtype, is_gru=is_gru
             )
         elif experiment_mode == 'memristor_no_comp':
-            # Train normally, apply non-idealities only at eval
+            # no_comp: always train with base_model (no noise during training)
+            # Noise is only injected during evaluation/testing via memristor_model
             train_metrics = _train_baseline(
-                model, train_loader, criterion, optimizer, device, epoch
+                model, train_loader, criterion, optimizer, device, epoch,
+                scaler=scaler, amp_dtype=amp_dtype, is_gru=is_gru
             )
             # Sync weights from base_model to memristor_model for evaluation
-            # This ensures memristor_model has the latest trained weights
-            _sync_weights_to_memristor_model(base_model, memristor_model)
+            # This ensures memristor_model has the latest trained weights before eval/test
+            if model is base_model:  # Should always be true for no_comp
+                _sync_weights_to_memristor_model(base_model, memristor_model)
         elif experiment_mode == 'memristor_with_comp':
-            compensation_method = config['experiment'].get('compensation_method', 'hat')
-            if compensation_method == 'hat':
-                train_metrics = _train_hat(
-                    model, train_loader, criterion, optimizer, device, epoch, device_model, config
-                )
-            elif compensation_method == 'learned_mapping':
-                train_metrics = _train_learned_mapping(
-                    model, train_loader, val_loader, device_model, criterion, 
-                    optimizer, device, epoch, config
-                )
-            else:
-                raise ValueError(f"Unknown compensation method: {compensation_method}. "
-                               f"Use 'hat' or 'learned_mapping'.")
+            train_metrics = _train_hat(
+                model, train_loader, criterion, optimizer, device, epoch, device_model, config,
+                scaler=scaler, amp_dtype=amp_dtype, is_gru=is_gru
+            )
         else:
             raise ValueError(f"Unknown experiment mode: {experiment_mode}")
         
         # 应用写入更新（根据 write_interval）
+        # memristor_no_comp 不执行 writeback：no_comp 仅“训练+推理时加噪声”，不模拟训练后写入硬件，
+        # 且 writeback 会覆盖权重导致准确率崩溃，且耗时极长（多脉冲仿真）。
         # 如果 write_interval = epochs，则在训练循环结束后执行（避免重复）
         # 否则，在训练循环中按间隔执行
-        # 注意：对于 learned_mapping (post_train模式)，跳过训练循环中的 writeback，
-        #       因为最终会在 post-train 阶段写入 W_final = W_fp + ΔW
-        compensation_method = config['experiment'].get('compensation_method', 'hat')
-        post_train_config = config['experiment'].get('post_train', {})
-        use_post_train = post_train_config.get('enabled', False)
-        skip_writeback_in_training = (compensation_method == 'learned_mapping' and use_post_train)
-        
         if (experiment_mode != 'baseline' and 
+            experiment_mode != 'memristor_no_comp' and
             device_model and 
             device_model.enable_update_model and 
-            not skip_writeback_in_training and  # 跳过 learned_mapping post_train 模式的训练循环写入
             write_interval < epochs and  # 只在非一次性写入时在训练循环中执行
             (epoch + 1) % write_interval == 0):
             experiment_logger.info(f"Applying writeback at epoch {epoch}")
@@ -501,23 +724,24 @@ def run_experiment(
                 max_pulses=write_max_pulses,
                 tolerance=write_tolerance
             )
-            # 如果是 memristor_no_comp 模式，还需要同步到 memristor_model
-            if experiment_mode == 'memristor_no_comp':
-                _sync_weights_to_memristor_model(base_model, memristor_model)
+            # memristor_no_comp 不在此分支内，无需同步
         
         # Validate
         if val_loader is not None:
             if experiment_mode == 'baseline':
-                val_metrics = _validate_baseline(model, val_loader, criterion, device)
+                val_metrics = _validate_baseline(
+                    model, val_loader, criterion, device,
+                    amp_dtype=amp_dtype, is_gru=is_gru
+                )
             elif experiment_mode == 'memristor_no_comp':
                 # For no_comp: use memristor model for validation (apply non-idealities)
                 val_metrics = _validate_memristor(
-                    memristor_model, val_loader, criterion, device, device_model
+                    memristor_model, val_loader, criterion, device, device_model, amp_dtype=amp_dtype, is_gru=is_gru
                 )
             else:  # memristor_with_comp
                 # For with_comp: model is already memristor-wrapped
                 val_metrics = _validate_memristor(
-                    model, val_loader, criterion, device, device_model
+                    model, val_loader, criterion, device, device_model, amp_dtype=amp_dtype, is_gru=is_gru
                 )
         else:
             val_metrics = {'acc1': 0.0, 'loss': 0.0}
@@ -544,6 +768,22 @@ def run_experiment(
         if 'update_std' in train_metrics:
             metrics['update_std'] = train_metrics.get('update_std', 0.0)
         
+        # Add ViT/GRU-specific metrics if available
+        is_vit = config.get('model_name', '') == 'vit_tiny'
+        is_gru = config.get('model_name', '') == 'gru_agnews'
+        for key in train_metrics:
+            if key.startswith('grad_norm_') or key.startswith('update_norm_') or \
+               key.startswith('logit_margin_') or key.startswith('act_'):
+                metrics[key] = train_metrics[key]
+        
+        # Use appropriate metrics collection based on model type
+        if is_vit and collect_gradient_norms_by_tier is not None:
+            # ViT metrics already collected in _train_hat
+            pass
+        elif is_gru and gru_collect_gradient_norms_by_tier is not None:
+            # GRU metrics already collected in _train_hat
+            pass
+        
         metrics_history.append(metrics)
         
         if tb_writer:
@@ -562,6 +802,27 @@ def run_experiment(
                 tb_writer.add_scalar('SyntheticNoise/AvgG', metrics['synthetic_noise_avg_g'], epoch)
                 tb_writer.add_scalar('SyntheticNoise/AvgR', metrics['synthetic_noise_avg_r'], epoch)
                 tb_writer.add_scalar('SyntheticNoise/EMANorm', metrics['synthetic_noise_ema_norm'], epoch)
+            
+            # Log ViT/GRU-specific metrics
+            is_vit = config.get('model_name', '') == 'vit_tiny'
+            is_gru = config.get('model_name', '') == 'gru_agnews'
+            prefix = 'ViT' if is_vit else ('GRU' if is_gru else 'Model')
+            
+            for key, value in metrics.items():
+                if key.startswith('grad_norm_'):
+                    tier = key.replace('grad_norm_', '')
+                    tb_writer.add_scalar(f'{prefix}/GradNorm_{tier}', value, epoch)
+                elif key.startswith('update_norm_'):
+                    tier = key.replace('update_norm_', '')
+                    tb_writer.add_scalar(f'{prefix}/UpdateNorm_{tier}', value, epoch)
+                elif key.startswith('logit_margin_'):
+                    tb_writer.add_scalar(f'{prefix}/{key}', value, epoch)
+                elif key.startswith('act_'):
+                    # Format: act_{tier}_{stat_name}
+                    parts = key.replace('act_', '').split('_', 1)
+                    if len(parts) == 2:
+                        tier, stat = parts
+                        tb_writer.add_scalar(f'{prefix}/Act_{tier}_{stat}', value, epoch)
         
         if wandb_run:
             wandb.log(metrics, step=epoch)
@@ -645,254 +906,12 @@ def run_experiment(
         else:
             best_acc = max(best_acc, val_metrics['acc1'])
     
-    # Post-train learned mapping if enabled
-    # Flow: Main network training (same as HAT) → W_fp → Mapping network training (no write_update) 
-    # → W_final = W_fp + ΔW → write_update → inference
-    if use_post_train:
-        experiment_logger.info("=" * 60)
-        experiment_logger.info("Starting post-train learned mapping phase")
-        experiment_logger.info("Flow: Main training (HAT) → W_fp → Mapping training → W_final → write_update → inference")
-        experiment_logger.info("=" * 60)
-        
-        # Initialize mapping network
-        mapping_alpha = float(config['experiment'].get('mapping_alpha', 0.5))
-        mapping_net = WeightMappingNet(
-            hidden_dim=config['experiment'].get('mapping_hidden_dim', 32),
-            alpha=mapping_alpha
-        ).to(device)
-        
-        # Set mapping network for all memristor layers
-        target_model = model
-        if hasattr(model, 'base_model'):
-            target_model = model.base_model
-        
-        num_set = 0
-        for module in target_model.modules():
-            if hasattr(module, 'set_learned_mapping'):
-                module.set_learned_mapping(mapping_net)
-                num_set += 1
-        experiment_logger.info(f"Post-train: Set mapping_net for {num_set} layers")
-        
-        # Get post_train parameters from config
-        post_train_num_epochs = int(post_train_config.get('num_epochs', 20))
-        post_train_lr = float(post_train_config.get('lr', 3e-4))
-        post_train_lambda_reg = float(post_train_config.get('lambda_reg', 1e-4))
-        post_train_lambda_scale = float(post_train_config.get('lambda_scale', 1e-3))
-        post_train_mode = post_train_config.get('mode', 'additive_only')  # Default to original additive mode
-        enable_sanity_check = config['experiment'].get('enable_sanity_check', False)
-        
-        experiment_logger.info(f"Post-train parameters: epochs={post_train_num_epochs}, "
-                              f"lr={post_train_lr}, lambda_reg={post_train_lambda_reg}, "
-                              f"lambda_scale={post_train_lambda_scale}, mode={post_train_mode}")
-        # Use random t for each batch to improve robustness to drift
-        post_train_use_random_t = post_train_config.get('use_random_t', True)  # Default to True
-        post_train_t_max = post_train_config.get('t_max', 1000)  # Default max t value
-        # Fixed t value for mapping_net training and evaluation (used when use_random_t=False)
-        post_train_t_fixed = post_train_config.get('t_fixed', 0)  # Default to 0
-        # t_eval: explicit evaluation t value (can be set independently of training t)
-        post_train_t_eval = post_train_config.get('t_eval', None)
-        experiment_logger.info(f"Post-train drift time: use_random_t={post_train_use_random_t}, "
-                              f"t_max={post_train_t_max if post_train_use_random_t else 'N/A'}, "
-                              f"t_fixed={post_train_t_fixed if not post_train_use_random_t else 'N/A'}, "
-                              f"t_eval={post_train_t_eval if post_train_t_eval is not None else 'auto'}")
-        experiment_logger.info("Starting post-train mapping_net training:")
-        
-        # Store t value for evaluation
-        # If t_eval is not set, use t_fixed when use_random_t=False, or 0 when use_random_t=True
-        if post_train_t_eval is not None:
-            run_experiment._post_train_t_fixed = post_train_t_eval
-        elif not post_train_use_random_t:
-            run_experiment._post_train_t_fixed = post_train_t_fixed
-        else:
-            run_experiment._post_train_t_fixed = 0  # Default to 0 when use_random_t=True
-        
-        # Temporarily switch drift_time_mode to 'param' for mapping_net training
-        # This allows use_random_t and t_fixed to take effect, while keeping
-        # the original drift_time_mode for HAT training (stage 1)
-        original_drift_time_mode = device_model.drift_time_mode
-        device_model.drift_time_mode = 'param'
-        experiment_logger.info(f"Temporarily switched drift_time_mode from '{original_drift_time_mode}' to 'param' for mapping_net training")
-        
-        # Train mapping_net while freezing main model
-        # train_weight_mapping will log each epoch internally
-        mapping_results = train_weight_mapping(
-            mapping_net=mapping_net,
-            model=model,
-            calibration_loader=train_loader,
-            device_model=device_model,
-            criterion=criterion,
-            device=device,
-            num_epochs=post_train_num_epochs,
-            lr=post_train_lr,
-            lambda_reg=post_train_lambda_reg,
-            lambda_scale=post_train_lambda_scale,
-            t=post_train_t_fixed,  # Fixed t value (used if use_random_t=False)
-            use_random_t=post_train_use_random_t,
-            t_max=post_train_t_max,
-            enable_sanity_check=enable_sanity_check,
-            mode=post_train_mode,
-        )
-        
-        # Restore original drift_time_mode after mapping_net training
-        device_model.drift_time_mode = original_drift_time_mode
-        experiment_logger.info(f"Restored drift_time_mode to '{original_drift_time_mode}'")
-        
-        experiment_logger.info(f"Post-train mapping_net training completed. "
-                              f"Best: val_acc={mapping_results.get('best_val_acc', 0.0):.2f}%, "
-                              f"loss={mapping_results.get('best_loss', 0.0):.4f}")
-        
-        # Compute W_final based on mode
-        # Flow: Main network training (same as HAT) → W_fp → Mapping network training (no write_update) 
-        # → W_final (depends on mode) → write_update → inference
-        # W_fp is the trained main model weights (already in model, adapted to non-idealities via HAT)
-        # ΔW is computed by mapping_net from W_fp (mapping_net takes W_fp as input, not W_noisy)
-        if post_train_mode == "additive_only":
-            experiment_logger.info("Computing W_final = W_fp + ΔW for all layers (additive_only mode)...")
-        else:
-            experiment_logger.info("Computing W_final = scale * W_fp + ΔW for all layers...")
-        mapping_net.eval()
-        with torch.no_grad():
-            for module in target_model.modules():
-                if not hasattr(module, 'weight') or module.weight is None:
-                    continue
-                
-                # W_fp: current weight (trained main model, same as HAT result)
-                W_fp = module.weight.data.clone()
-                
-                # Compute W_noisy: W_fp with non-idealities applied (for noise_scale estimation)
-                # This simulates what would be read from hardware
-                Gp, Gn, max_abs = device_model.map_weights_to_conductance_diff_adaptive(W_fp)
-                Gp_noisy = device_model.apply_nonidealities(Gp, t=0, seed=None)
-                Gn_noisy = device_model.apply_nonidealities(Gn, t=0, seed=None)
-                G_range = device_model.G_max - device_model.G_min
-                scale_back = max_abs / (G_range + 1e-12)
-                scale_back = torch.clamp(scale_back, min=1e-9, max=1e9)
-                W_noisy = (Gp_noisy - Gn_noisy) * scale_back
-                
-                # Estimate noise_scale for mapping_net
-                noise_est = (W_noisy - W_fp).abs()
-                est_mean = float(noise_est.mean().detach().cpu().item() + 1e-12)
-                min_noise_scale = 1e-8
-                max_noise_scale = 0.5 * (device_model.wmax - device_model.wmin)
-                noise_scale = float(min(max(est_mean, min_noise_scale), max_noise_scale))
-                
-                # Get delta from mapping_net
-                # Note: mapping_net takes W_fp as input (not W_noisy), as per learned_weight_mapping.py design
-                # Determine layer type and conv_shape
-                if isinstance(module, nn.Conv2d):
-                    layer_type = 'conv'
-                    conv_shape = (module.out_channels, module.in_channels, 
-                                 module.kernel_size[0] if isinstance(module.kernel_size, tuple) else module.kernel_size,
-                                 module.kernel_size[1] if isinstance(module.kernel_size, tuple) else module.kernel_size)
-                else:
-                    layer_type = 'linear'
-                    conv_shape = None
-                
-                # mapping_net takes W_fp as input (not W_noisy)
-                delta_W = mapping_net(W_fp, noise_scale=noise_scale, layer_type=layer_type, conv_shape=conv_shape)
-                
-                # Apply safety clamping (same as in hardware_linear_forward_with_weight_mapping)
-                mapping_max_frac = float(config['experiment'].get('mapping_max_frac', 0.5))
-                bound = mapping_max_frac * (W_noisy.abs() + 1e-9)
-                delta_W = torch.max(torch.min(delta_W, bound), -bound)
-                abs_clip = (device_model.wmax - device_model.wmin) * 0.5
-                delta_W = torch.clamp(delta_W, -abs_clip, abs_clip)
-                
-                # Compute W_final based on mode
-                if post_train_mode == "additive_only":
-                    # Original additive-only mode: W_final = W_fp + ΔW
-                    W_final = W_fp + delta_W
-                else:
-                    # Multiplicative + additive mode: W_final = scale * W_fp + ΔW
-                    # Apply multiplicative calibration: W_scaled = scale * W_fp
-                    scale = mapping_net.scale if hasattr(mapping_net, 'scale') else torch.tensor(1.0, device=W_fp.device)
-                    W_scaled = scale * W_fp
-                    # Then add additive correction: W_final = W_scaled + delta_W
-                    W_final = W_scaled + delta_W
-                
-                # Clamp to allowed weight range
-                W_final = torch.clamp(W_final, device_model.wmin, device_model.wmax)
-                
-                # Update module weight to W_final
-                module.weight.data.copy_(W_final)
-        
-        # Log scale value (if applicable)
-        if hasattr(mapping_net, 'scale') and post_train_mode != "additive_only":
-            experiment_logger.info(f"learned scale: {mapping_net.scale.item():.6f}")
-        if post_train_mode == "additive_only":
-            experiment_logger.info("W_final = W_fp + ΔW computed and stored in model weights")
-        else:
-            experiment_logger.info("W_final = scale * W_fp + ΔW computed and stored in model weights")
-        
-        # Write W_final to hardware using write_update (if enabled)
-        # This simulates the hardware programming process after computing W_final
-        if (device_model and device_model.enable_update_model):
-            experiment_logger.info("Writing W_final to hardware using write_update...")
-            _apply_writeback(
-                model, device_model,
-                write_t_min, write_t_scale, write_V_write,
-                max_pulses=write_max_pulses,
-                tolerance=write_tolerance
-            )
-            experiment_logger.info("W_final written to hardware")
-        else:
-            experiment_logger.info("Writeback disabled (enable_update_model=False), skipping hardware write")
-        
-        # Disable mapping_net for inference (compensation is now baked into weights)
-        experiment_logger.info("Disabling mapping_net for inference (compensation baked into weights)")
-        for module in target_model.modules():
-            if hasattr(module, 'set_learned_mapping'):
-                module.set_learned_mapping(None)
-        
-        # Re-validate with W_final (mapping_net disabled, using hardware weights)
-        # Use 'param' mode for evaluation to use the same t as mapping_net training
-        device_model.drift_time_mode = 'param'
-        if val_loader is not None:
-            val_metrics = _validate_memristor(
-                model, val_loader, criterion, device, device_model
-            )
-            experiment_logger.info(f"Post-writeback validation: acc={val_metrics['acc1']:.2f}%, "
-                                  f"loss={val_metrics['loss']:.4f}")
-            
-            # Update best_acc if improved
-            if val_metrics['acc1'] > best_acc:
-                best_acc = val_metrics['acc1']
-                best_model_path = os.path.join(output_dir, 'model_best.pth')
-                checkpoint_data = {
-                    'epoch': epochs,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'best_acc': best_acc,
-                    'config': config,
-                }
-                # Save mapping_net state (for reference, though it's disabled)
-                checkpoint_data['mapping_net_state_dict'] = mapping_net.state_dict()
-                save_checkpoint(checkpoint_data, best_model_path, is_best=True)
-                experiment_logger.info(f"Saved best model after post-train with acc={best_acc:.2f}%")
-        
-        experiment_logger.info("=" * 60)
-        experiment_logger.info("Post-train learned mapping phase completed")
-        experiment_logger.info("=" * 60)
-        
-        # Store mapping_net for checkpoint saving
-        if use_post_train:
-            # Store mapping_net state for checkpoint
-            if not hasattr(run_experiment, '_post_train_mapping_net_state'):
-                run_experiment._post_train_mapping_net_state = mapping_net.state_dict()
-    
     # 在训练循环结束后、最终测试前，如果 write_interval = epochs，执行最后一次 writeback
-    # 这确保最终测试使用的是经过写入更新后的权重
-    # 注意：对于 learned_mapping (post_train模式)，跳过这里的 writeback，
-    #       因为已经在 post-train 阶段完成了：W_final = W_fp + ΔW → write_update
-    compensation_method = config['experiment'].get('compensation_method', 'hat')
-    post_train_config = config['experiment'].get('post_train', {})
-    use_post_train = post_train_config.get('enabled', False)
-    skip_writeback_after_training = (compensation_method == 'learned_mapping' and use_post_train)
-    
+    # memristor_no_comp 不执行：会覆盖权重导致准确率崩溃，且多脉冲仿真耗时极长
     if (experiment_mode != 'baseline' and 
+        experiment_mode != 'memristor_no_comp' and
         device_model and 
         device_model.enable_update_model and 
-        not skip_writeback_after_training and  # 跳过 learned_mapping post_train 模式的训练后写入
         write_interval == epochs):
         experiment_logger.info("Applying final writeback before test evaluation")
         _apply_writeback(
@@ -901,26 +920,24 @@ def run_experiment(
             max_pulses=write_max_pulses,
             tolerance=write_tolerance
         )
-        # 如果是 memristor_no_comp 模式，还需要同步到 memristor_model
-        if experiment_mode == 'memristor_no_comp':
-            _sync_weights_to_memristor_model(base_model, memristor_model)
+        # memristor_no_comp 不在此分支内，无需同步
     
     # Final evaluation on test set
     if test_loader:
-        # For learned_mapping with post_train, ensure drift_time_mode='param' for consistent t
-        if use_post_train and device_model is not None:
-            device_model.drift_time_mode = 'param'
-        
         if experiment_mode == 'baseline':
-            test_metrics = _validate_baseline(model, test_loader, criterion, device)
+            test_metrics = _validate_baseline(
+                model, test_loader, criterion, device, is_gru=is_gru
+            )
         elif experiment_mode == 'memristor_no_comp':
-            # For no_comp: sync weights one more time before final test evaluation
+            # For no_comp: always sync weights from base_model (trained without noise) to memristor_model
+            # Then use memristor_model for test evaluation (with noise injected)
+            # Note: model should always be base_model for no_comp (we train clean, eval with noise)
             _sync_weights_to_memristor_model(base_model, memristor_model)
             # Use memristor model for test (apply non-idealities)
-            test_metrics = _validate_memristor(memristor_model, test_loader, criterion, device, device_model)
+            test_metrics = _validate_memristor(memristor_model, test_loader, criterion, device, device_model, is_gru=is_gru)
         else:  # memristor_with_comp
             # For with_comp: model is already memristor-wrapped
-            test_metrics = _validate_memristor(model, test_loader, criterion, device, device_model)
+            test_metrics = _validate_memristor(model, test_loader, criterion, device, device_model, is_gru=is_gru)
         # 构建测试日志信息
         test_log_msg = (
             f"Test accuracy: {test_metrics['acc1']:.2f}%, loss: {test_metrics['loss']:.4f}"
@@ -949,11 +966,6 @@ def run_experiment(
         'test_acc': test_metrics['acc1'],
         'config': config,
     }
-    
-    # Save mapping_net state if post_train was used
-    if use_post_train and hasattr(run_experiment, '_post_train_mapping_net_state'):
-        checkpoint_data['mapping_net_state_dict'] = run_experiment._post_train_mapping_net_state
-        experiment_logger.info("Saved mapping_net state in checkpoint")
     
     save_checkpoint(checkpoint_data, final_model_path)
     
@@ -995,6 +1007,9 @@ def _train_baseline(
     optimizer: optim.Optimizer,
     device: torch.device,
     epoch: int,
+    scaler: Optional[torch.amp.GradScaler] = None,
+    amp_dtype: Optional[torch.dtype] = None,
+    is_gru: bool = False,
 ) -> Dict[str, float]:
     """Standard training without memristor non-idealities."""
     model.train()
@@ -1006,8 +1021,13 @@ def _train_baseline(
     grad_vars = []  # List of gradient variances per batch
     update_stds = []  # List of update standard deviations per batch
     
-    for batch_idx, (data, target) in enumerate(train_loader):
+    use_amp = scaler is not None and amp_dtype is not None
+    
+    for batch_idx, batch in enumerate(train_loader):
+        data, target, lengths = _unpack_batch(batch, is_agnews=is_gru)
         data, target = data.to(device), target.to(device)
+        if lengths is not None:
+            lengths = lengths.to(device)
         
         # Validate labels before forward pass (only on first batch of first epoch to avoid overhead)
         if epoch == 0 and batch_idx == 0:
@@ -1015,7 +1035,11 @@ def _train_baseline(
             min_label = target.min().item()
             # Get model output size
             with torch.no_grad():
-                sample_output = model(data[:1])
+                if is_gru and lengths is not None:
+                    sample_lengths = lengths[:1] if lengths is not None else None
+                    sample_output = model(data[:1], lengths=sample_lengths)
+                else:
+                    sample_output = model(data[:1])
                 model_output_size = sample_output.shape[1]
             
             if max_label >= model_output_size or min_label < 0:
@@ -1036,9 +1060,27 @@ def _train_baseline(
                 weights_before.append(param.data.clone())
         
         optimizer.zero_grad()
-        output = model(data)
-        loss = criterion(output, target)
-        loss.backward()
+        
+        # Mixed precision forward pass (GRU needs lengths for pack_padded_sequence)
+        if use_amp:
+            with torch.amp.autocast('cuda', dtype=amp_dtype):
+                if is_gru and lengths is not None:
+                    output = model(data, lengths=lengths)
+                else:
+                    output = model(data)
+                loss = criterion(output, target)
+        else:
+            if is_gru and lengths is not None:
+                output = model(data, lengths=lengths)
+            else:
+                output = model(data)
+            loss = criterion(output, target)
+        
+        # Backward pass with gradient scaling if using AMP
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         
         # Compute gradient statistics before optimizer.step()
         grad_list = []
@@ -1057,8 +1099,118 @@ def _train_baseline(
             # Compute gradient variance (across all parameters)
             grad_var = all_grads.var().item()
             grad_vars.append(grad_var)
+            
+            # Print gradient statistics for each layer (only on first batch of first few epochs)
+            if batch_idx == 0 and epoch < 3:
+                print("=" * 80)
+                print(f"Gradient Statistics (Epoch {epoch}, Batch {batch_idx}) - Baseline:")
+                print("-" * 80)
+                
+                # Get base model if wrapped
+                base_model = model
+                if hasattr(model, 'base_model'):
+                    base_model = model.base_model
+                
+                layer_grad_stats = {}
+                for name, param in base_model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        grad_max = param.grad.abs().max().item()
+                        grad_mean = param.grad.mean().item()
+                        param_norm = param.data.norm().item()
+                        
+                        # Determine layer type
+                        layer_type = "unknown"
+                        if 'embedding' in name:
+                            layer_type = "embedding"
+                        elif 'gru' in name:
+                            if 'weight_ih' in name:
+                                layer_type = "gru_weight_ih"
+                            elif 'weight_hh' in name:
+                                layer_type = "gru_weight_hh"
+                            elif 'bias' in name:
+                                layer_type = "gru_bias"
+                            else:
+                                layer_type = "gru_other"
+                        elif 'head' in name:
+                            layer_type = "head"
+                        
+                        # Group by layer type
+                        if layer_type not in layer_grad_stats:
+                            layer_grad_stats[layer_type] = {
+                                'names': [],
+                                'grad_norms': [],
+                                'grad_maxs': [],
+                                'grad_means': [],
+                                'param_norms': [],
+                            }
+                        
+                        layer_grad_stats[layer_type]['names'].append(name)
+                        layer_grad_stats[layer_type]['grad_norms'].append(grad_norm)
+                        layer_grad_stats[layer_type]['grad_maxs'].append(grad_max)
+                        layer_grad_stats[layer_type]['grad_means'].append(grad_mean)
+                        layer_grad_stats[layer_type]['param_norms'].append(param_norm)
+                    else:
+                        # No gradient
+                        layer_type = "unknown"
+                        if 'embedding' in name:
+                            layer_type = "embedding"
+                        elif 'gru' in name:
+                            layer_type = "gru"
+                        elif 'head' in name:
+                            layer_type = "head"
+                        
+                        if layer_type not in layer_grad_stats:
+                            layer_grad_stats[layer_type] = {
+                                'names': [],
+                                'grad_norms': [],
+                                'grad_maxs': [],
+                                'grad_means': [],
+                                'param_norms': [],
+                            }
+                        layer_grad_stats[layer_type]['names'].append(name)
+                        layer_grad_stats[layer_type]['grad_norms'].append(0.0)
+                        layer_grad_stats[layer_type]['grad_maxs'].append(0.0)
+                        layer_grad_stats[layer_type]['grad_means'].append(0.0)
+                        layer_grad_stats[layer_type]['param_norms'].append(param.data.norm().item())
+                
+                # Print statistics by layer type
+                for layer_type in sorted(layer_grad_stats.keys()):
+                    stats = layer_grad_stats[layer_type]
+                    if not stats['names']:
+                        continue
+                    
+                    avg_grad_norm = np.mean(stats['grad_norms'])
+                    max_grad_norm = np.max(stats['grad_norms'])
+                    avg_grad_max = np.mean(stats['grad_maxs'])
+                    avg_grad_mean = np.mean(stats['grad_means'])
+                    zero_grad_count = sum(1 for n in stats['grad_norms'] if n < 1e-8)
+                    
+                    status = "✓" if avg_grad_norm > 1e-6 else "✗"
+                    print(f"{status} {layer_type:20s}: "
+                          f"avg_grad_norm={avg_grad_norm:.2e}, "
+                          f"max_grad_norm={max_grad_norm:.2e}, "
+                          f"avg_grad_max={avg_grad_max:.2e}, "
+                          f"zero_grad_layers={zero_grad_count}/{len(stats['names'])}")
+                    
+                    # Print individual layer details for GRU (to see which gates are blocked)
+                    if 'gru' in layer_type and epoch == 0:
+                        for name, grad_norm in zip(stats['names'], stats['grad_norms']):
+                            gate_info = ""
+                            if 'weight_ih' in name or 'weight_hh' in name:
+                                gate_info = " (gates: reset, update, candidate)"
+                            
+                            grad_status = "✓" if grad_norm > 1e-6 else "✗ BLOCKED"
+                            print(f"    {grad_status} {name}: grad_norm={grad_norm:.2e}{gate_info}")
+                
+                print("=" * 80)
         
-        optimizer.step()
+        # Optimizer step with gradient scaling
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         
         # Compute update statistics (weight change after optimizer.step())
         if weights_before:
@@ -1093,328 +1245,6 @@ def _train_baseline(
         'grad_var': avg_grad_var,
         'update_std': avg_update_std,
     }
-
-
-def _train_learned_mapping(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    device_model: MemristorDeviceModel,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    device: torch.device,
-    epoch: int,
-    config: Dict[str, Any],
-) -> Dict[str, float]:
-    """
-    Train with learned mapping compensation strategy.
-    
-    Supports two modes:
-    1. Post-train mode (post_train.enabled=True): 
-       - Train main model same as HAT (non-idealities applied during forward, 
-         weights updated via normal gradient descent) → get W_fp
-       - After main training, freeze main model and train mapping_net (no write_update)
-       - Compute W_final = W_fp + ΔW
-       - Call write_update to write W_final to hardware
-       - Inference with hardware weights
-    2. Joint training mode (post_train.enabled=False):
-       - Alternate between training mapping_net and main model each epoch
-    """
-    # Check if post_train is enabled
-    post_train_config = config['experiment'].get('post_train', {})
-    use_post_train = post_train_config.get('enabled', False)
-    
-    if use_post_train:
-        # Post-train mode: Train main model same as HAT (non-idealities applied during forward, 
-        # but weights updated via normal gradient descent to get W_fp)
-        # mapping_net will be trained after main model training completes
-        logger.info(f"Post-train mode: Training main model (same as HAT, epoch {epoch})")
-        
-        # Ensure no mapping_net is set during main model training
-        # This ensures we use non-idealities during forward but update weights normally
-        target_model = model
-        if hasattr(model, 'base_model'):
-            target_model = model.base_model
-        
-        # Explicitly disable mapping_net in all layers
-        for module in target_model.modules():
-            if hasattr(module, 'mapping_net'):
-                module.mapping_net = None
-            if hasattr(module, 'set_learned_mapping'):
-                module.set_learned_mapping(None)
-        
-        # Train main model same as HAT: non-idealities applied during forward pass,
-        # but weights are updated via normal gradient descent (not W_noisy)
-        # This produces W_fp (float-point weights adapted to non-idealities)
-        model.train()
-        losses = AverageMeter('Loss', ':.4f')
-        top1 = AverageMeter('Acc@1', ':6.2f')
-        
-        # Gradient statistics for training dynamics analysis
-        grad_norms = []
-        grad_vars = []
-        update_stds = []
-        
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
-            
-            # Save weights before update
-            weights_before = []
-            for param in model.parameters():
-                if param.requires_grad:
-                    weights_before.append(param.data.clone())
-            
-            optimizer.zero_grad()
-            
-            # Forward with non-idealities (same as HAT)
-            # Weights are updated via normal gradient descent, producing W_fp
-            t = epoch * len(train_loader) + batch_idx
-            seed = None  # Let randomness vary naturally
-            try:
-                output = model(data, t=t, seed=seed)
-            except TypeError:
-                output = model(data)
-            
-            loss_task = criterion(output, target)
-            
-            # Boundary regularization (if enabled)
-            loss = loss_task
-            boundary_reg_config = config.get('experiment', {}).get('boundary_regularization', {})
-            if boundary_reg_config.get('enabled', False):
-                lambda_boundary = float(boundary_reg_config.get('lambda', 1e-4))
-                beta = float(boundary_reg_config.get('beta', 0.8))
-                boundary_reg = compute_boundary_regularization(model, device_model, beta=beta)
-                loss = loss_task + lambda_boundary * boundary_reg
-            
-            loss.backward()
-            
-            # Compute gradient statistics
-            grad_list = []
-            for param in model.parameters():
-                if param.grad is not None:
-                    grad_list.append(param.grad.flatten())
-            
-            if grad_list:
-                all_grads = torch.cat(grad_list)
-                grad_norm = all_grads.norm().item()
-                grad_norms.append(grad_norm)
-                grad_var = all_grads.var().item()
-                grad_vars.append(grad_var)
-            
-            optimizer.step()
-            
-            # Compute update statistics
-            if weights_before:
-                updates = []
-                param_idx = 0
-                for param in model.parameters():
-                    if param.requires_grad and param_idx < len(weights_before):
-                        update = (param.data - weights_before[param_idx]).flatten()
-                        updates.append(update)
-                        param_idx += 1
-                
-                if updates:
-                    all_updates = torch.cat(updates)
-                    update_std = all_updates.std().item()
-                    update_stds.append(update_std)
-            
-            acc1 = accuracy(output, target, topk=(1,))[0]
-            losses.update(loss.item(), data.size(0))
-            top1.update(acc1, data.size(0))
-        
-        avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
-        avg_grad_var = np.mean(grad_vars) if grad_vars else 0.0
-        std_grad_norm = np.std(grad_norms) if grad_norms else 0.0
-        avg_update_std = np.mean(update_stds) if update_stds else 0.0
-        
-        return {
-            'loss': losses.avg,
-            'acc1': top1.avg,
-            'mapping_loss': 0.0,
-            'grad_norm': avg_grad_norm,
-            'grad_norm_std': std_grad_norm,
-            'grad_var': avg_grad_var,
-            'update_std': avg_update_std,
-        }
-    else:
-        # Joint training mode: Alternate between mapping_net and main model
-        # Initialize mapping network (create once, reuse across epochs)
-        if not hasattr(_train_learned_mapping, 'mapping_net'):
-            mapping_alpha = float(config['experiment'].get('mapping_alpha', 0.5))
-            _train_learned_mapping.mapping_net = WeightMappingNet(
-                hidden_dim=config['experiment'].get('mapping_hidden_dim', 32),
-                alpha=mapping_alpha
-            ).to(device)
-        
-        mapping_net = _train_learned_mapping.mapping_net
-        
-        # Set mapping network for all memristor layers
-        # IMPORTANT: If model is a MemristorModel wrapper, we need to access base_model
-        target_model = model
-        if hasattr(model, 'base_model'):
-            target_model = model.base_model
-            logger.info("_train_learned_mapping: Model is MemristorModel wrapper, accessing base_model")
-        
-        num_set = 0
-        for module in target_model.modules():
-            if hasattr(module, 'set_learned_mapping'):
-                module.set_learned_mapping(mapping_net)
-                num_set += 1
-                # Verify immediately
-                if getattr(module, 'mapping_net', None) is not mapping_net:
-                    logger.error(f"ERROR: Failed to set mapping_net for {type(module).__name__}!")
-        logger.info(f"_train_learned_mapping: Set mapping_net for {num_set} layers (before train_weight_mapping)")
-        
-        # Use train_weight_mapping from learned_weight_mapping.py
-        # This trains the mapping network while freezing the main model
-        mapping_epochs = int(config['experiment'].get('mapping_epochs_per_main_epoch', 1))
-        t_step = epoch * len(train_loader)
-        
-        # Use calibration loader (can use train_loader or a subset)
-        calibration_loader = train_loader
-        
-        # Get enable_sanity_check from config, default to False
-        enable_sanity_check = config['experiment'].get('enable_sanity_check', False)
-        logger.info(f"Learned mapping training: enable_sanity_check={enable_sanity_check}, "
-                    f"mapping_epochs={mapping_epochs}, lr={config['experiment'].get('mapping_lr', 1e-4)}")
-        
-        # Get mapping mode and lambda_scale from config (with defaults)
-        mapping_mode = config['experiment'].get('mapping_mode', 'additive_only')
-        mapping_lambda_scale = float(config['experiment'].get('mapping_lambda_scale', 1e-3))
-        
-        mapping_results = train_weight_mapping(
-            mapping_net=mapping_net,
-            model=model,
-            calibration_loader=calibration_loader,
-            device_model=device_model,
-            criterion=criterion,
-            device=device,
-            num_epochs=mapping_epochs,
-            lr=float(config['experiment'].get('mapping_lr', 1e-4)),
-            lambda_reg=float(config['experiment'].get('mapping_lambda_reg', 1e-4)),
-            lambda_scale=mapping_lambda_scale,
-            t=t_step,
-            enable_sanity_check=enable_sanity_check,
-            mode=mapping_mode,
-        )
-        
-        # Get training metrics with learned mapping applied
-        # Ensure mapping_net is still set after train_weight_mapping
-        if hasattr(model, 'base_model'):
-            verify_target = model.base_model
-        else:
-            verify_target = model
-        
-        # Re-verify mapping_net is set (train_weight_mapping should have set it)
-        verify_count = 0
-        for module in verify_target.modules():
-            if hasattr(module, 'mapping_net'):
-                verify_count += 1
-                mn = getattr(module, 'mapping_net', None)
-                if mn is not mapping_net:
-                    logger.warning(f"WARNING: mapping_net mismatch for {type(module).__name__} after train_weight_mapping! "
-                                 f"Expected {id(mapping_net)}, got {id(mn) if mn is not None else None}")
-                    # Re-set it to be safe
-                    if hasattr(module, 'set_learned_mapping'):
-                        module.set_learned_mapping(mapping_net)
-        
-        model.train()
-        losses = AverageMeter('Loss', ':.4f')
-        top1 = AverageMeter('Acc@1', ':6.2f')
-        
-        # Gradient statistics for training dynamics analysis
-        grad_norms = []
-        grad_vars = []
-        update_stds = []
-        
-        # Train the main model with learned mapping applied
-        # The mapping_net is already trained and set in layers
-        # Now we need to train the main model weights while keeping mapping_net fixed
-        # Ensure mapping_net parameters are frozen but gradients can flow through
-        for p in mapping_net.parameters():
-            p.requires_grad = False
-        
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
-            
-            # Save weights before update
-            weights_before = []
-            for param in model.parameters():
-                if param.requires_grad:
-                    weights_before.append(param.data.clone())
-            
-            optimizer.zero_grad()
-            
-            # Forward pass with learned mapping (mapping_net is already set in layers)
-            # Gradients will flow through mapping_net to main model weights
-            try:
-                output = model(data, t=t_step + batch_idx)
-            except TypeError:
-                output = model(data)
-            
-            loss_task = criterion(output, target)
-            
-            # Boundary regularization (if enabled)
-            loss = loss_task
-            boundary_reg_config = config.get('experiment', {}).get('boundary_regularization', {})
-            if boundary_reg_config.get('enabled', False):
-                lambda_boundary = float(boundary_reg_config.get('lambda', 1e-4))
-                beta = float(boundary_reg_config.get('beta', 0.8))
-                boundary_reg = compute_boundary_regularization(model, device_model, beta=beta)
-                loss = loss_task + lambda_boundary * boundary_reg
-            
-            # Backward pass to update main model weights
-            # mapping_net parameters are frozen, so only main model weights will be updated
-            loss.backward()
-            
-            # Compute gradient statistics
-            grad_list = []
-            for param in model.parameters():
-                if param.grad is not None:
-                    grad_list.append(param.grad.flatten())
-            
-            if grad_list:
-                all_grads = torch.cat(grad_list)
-                grad_norm = all_grads.norm().item()
-                grad_norms.append(grad_norm)
-                grad_var = all_grads.var().item()
-                grad_vars.append(grad_var)
-            
-            optimizer.step()
-            
-            # Compute update statistics
-            if weights_before:
-                updates = []
-                param_idx = 0
-                for param in model.parameters():
-                    if param.requires_grad and param_idx < len(weights_before):
-                        update = (param.data - weights_before[param_idx]).flatten()
-                        updates.append(update)
-                        param_idx += 1
-                
-                if updates:
-                    all_updates = torch.cat(updates)
-                    update_std = all_updates.std().item()
-                    update_stds.append(update_std)
-            
-            acc1 = accuracy(output, target, topk=(1,))[0]
-            losses.update(loss.item(), data.size(0))
-            top1.update(acc1, data.size(0))
-        
-        avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
-        avg_grad_var = np.mean(grad_vars) if grad_vars else 0.0
-        std_grad_norm = np.std(grad_norms) if grad_norms else 0.0
-        avg_update_std = np.mean(update_stds) if update_stds else 0.0
-        
-        return {
-            'loss': losses.avg,
-            'acc1': top1.avg,
-            'mapping_loss': mapping_results.get('best_loss', 0.0),
-            'grad_norm': avg_grad_norm,
-            'grad_norm_std': std_grad_norm,
-            'grad_var': avg_grad_var,
-            'update_std': avg_update_std,
-        }
 
 
 def _sync_weights_to_memristor_model(base_model: nn.Module, memristor_model: nn.Module) -> None:
@@ -1693,11 +1523,13 @@ def _train_hat(
     epoch: int,
     device_model: MemristorDeviceModel,
     config: Optional[Dict[str, Any]] = None,
+    scaler: Optional[torch.amp.GradScaler] = None,
+    amp_dtype: Optional[torch.dtype] = None,
+    is_gru: bool = False,
 ) -> Dict[str, float]:
     """Hardware-aware training with non-idealities during forward.
     
     This function ensures HAT training uses memristor_wrappers.py layers
-    (which don't have mapping_net) and never uses learned_weight_mapping.py layers.
     """
     model.train()
     losses = AverageMeter('Loss', ':.4f')
@@ -1708,22 +1540,37 @@ def _train_hat(
     grad_vars = []  # List of gradient variances per batch
     update_stds = []  # List of update standard deviations per batch
     
-    # Ensure no mapping_net is set for HAT training
-    # If model has base_model (MemristorModel wrapper), check both
-    target_model = model
-    if hasattr(model, 'base_model'):
-        target_model = model.base_model
+    # ViT/GRU-specific metrics
+    is_vit = config is not None and config.get('model_name', '') == 'vit_tiny'
+    is_gru = is_gru or (config is not None and config.get('model_name', '') == 'gru_agnews')
     
-    # Explicitly disable mapping_net in all layers
-    for module in target_model.modules():
-        if hasattr(module, 'mapping_net'):
-            module.mapping_net = None
-        # Also try set_learned_mapping if it exists (for learned_weight_mapping layers)
-        if hasattr(module, 'set_learned_mapping'):
-            module.set_learned_mapping(None)
+    if is_vit:
+        tier_grad_norms = {'patch_embed': [], 'attn_proj': [], 'mlp': [], 'head': []}
+        tier_update_norms = {'patch_embed': [], 'attn_proj': [], 'mlp': [], 'head': []}
+    elif is_gru:
+        tier_grad_norms = {'embedding': [], 'gru_weight': [], 'head': []}
+        tier_update_norms = {'embedding': [], 'gru_weight': [], 'head': []}
+    else:
+        tier_grad_norms = {}
+        tier_update_norms = {}
     
-    for batch_idx, (data, target) in enumerate(train_loader):
+    logit_margins = []
+    activation_hooks = None
+    hook_handles = []
+    
+    use_amp = scaler is not None and amp_dtype is not None
+    
+    # Register activation hooks for ViT/GRU if available
+    if is_vit and register_activation_hooks is not None:
+        activation_hooks, hook_handles = register_activation_hooks(model)
+    elif is_gru and gru_register_activation_hooks is not None:
+        activation_hooks, hook_handles = gru_register_activation_hooks(model)
+    
+    for batch_idx, batch in enumerate(train_loader):
+        data, target, lengths = _unpack_batch(batch, is_agnews=is_gru)
         data, target = data.to(device), target.to(device)
+        if lengths is not None:
+            lengths = lengths.to(device)
         
         # Save weights before update (for computing update statistics)
         weights_before = []
@@ -1735,22 +1582,61 @@ def _train_hat(
         
         # Forward with non-idealities (t increases with each batch)
         t = epoch * len(train_loader) + batch_idx
-        # For memristor-wrapped models, always pass t parameter
-        # Use different seed for each batch to ensure non-idealities vary
-        # This is important for HAT training to see diverse non-ideality effects
-        seed = None  # Let randomness vary naturally for HAT
-        try:
-            output = model(data, t=t, seed=seed)
-        except TypeError:
-            # Fallback if model doesn't accept t parameter
-            output = model(data)
+        
+        # Control noise sampling frequency
+        # If noise_sampling_interval > 1, only sample noise every k steps
+        # Within the same interval, reuse the same noise pattern
+        noise_sampling_interval = config.get('experiment', {}).get('noise_sampling_interval', 1) if config else 1
+        global_step = epoch * len(train_loader) + batch_idx
+        
+        if noise_sampling_interval > 1:
+            # Calculate which interval we're in
+            interval_id = global_step // noise_sampling_interval
+            # Use interval_id as seed to ensure same noise pattern within the interval
+            # Add a large offset to avoid conflicts with other uses of seed
+            seed = 1000000 + interval_id  # Fixed seed for this interval
+        else:
+            # Default: sample noise every step (seed=None means random each time)
+            seed = None  # Let randomness vary naturally for HAT
+        
+        # Mixed precision forward pass
+        if use_amp:
+            with torch.amp.autocast('cuda', dtype=amp_dtype):
+                try:
+                    if is_gru and lengths is not None:
+                        output = model(data, lengths=lengths, t=t, seed=seed)
+                    else:
+                        output = model(data, t=t, seed=seed)
+                except TypeError:
+                    # Fallback if model doesn't accept t parameter
+                    if is_gru and lengths is not None:
+                        output = model(data, lengths=lengths)
+                    else:
+                        output = model(data)
+        else:
+            try:
+                if is_gru and lengths is not None:
+                    output = model(data, lengths=lengths, t=t, seed=seed)
+                else:
+                    output = model(data, t=t, seed=seed)
+            except TypeError:
+                # Fallback if model doesn't accept t parameter
+                if is_gru and lengths is not None:
+                    output = model(data, lengths=lengths)
+                else:
+                    output = model(data)
         
         # Check for NaN in output
         if torch.isnan(output).any():
             logger.warning(f"NaN detected in output at epoch {epoch}, batch {batch_idx}. Skipping batch.")
             continue
         
-        loss_task = criterion(output, target)
+        # Mixed precision loss computation
+        if use_amp:
+            with torch.amp.autocast('cuda', dtype=amp_dtype):
+                loss_task = criterion(output, target)
+        else:
+            loss_task = criterion(output, target)
         
         # Check for NaN in loss
         if torch.isnan(loss_task) or torch.isinf(loss_task):
@@ -1767,7 +1653,11 @@ def _train_hat(
                 boundary_reg = compute_boundary_regularization(model, device_model, beta=beta)
                 loss = loss_task + lambda_boundary * boundary_reg
         
-        loss.backward()
+        # Backward pass with gradient scaling if using AMP
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         
         # Compute gradient statistics before optimizer.step()
         # Get all parameter gradients
@@ -1788,18 +1678,146 @@ def _train_hat(
             grad_var = all_grads.var().item()
             grad_vars.append(grad_var)
             
+            # ViT/GRU: Collect tier-based gradient norms
+            if is_vit and collect_gradient_norms_by_tier is not None:
+                tier_grads = collect_gradient_norms_by_tier(model)
+                for tier, norm in tier_grads.items():
+                    if tier in tier_grad_norms:
+                        tier_grad_norms[tier].append(norm)
+            elif is_gru and gru_collect_gradient_norms_by_tier is not None:
+                tier_grads = gru_collect_gradient_norms_by_tier(model)
+                for tier, norm in tier_grads.items():
+                    if tier in tier_grad_norms:
+                        tier_grad_norms[tier].append(norm)
+            
             # Debug: log very small gradients (potential gradient vanishing)
             if grad_norm < 1e-6 and batch_idx == 0:
                 logger.warning(f"Very small gradient norm detected: {grad_norm:.2e} at epoch {epoch}, batch {batch_idx}. "
                              f"This may indicate gradient vanishing (e.g., direct ADC mode).")
             
+            # Print gradient statistics for each layer (only on first batch of first few epochs)
+            if batch_idx == 0 and epoch < 3:
+                print("=" * 80)
+                print(f"Gradient Statistics (Epoch {epoch}, Batch {batch_idx}):")
+                print("-" * 80)
+                
+                # Get base model if wrapped
+                base_model = model
+                if hasattr(model, 'base_model'):
+                    base_model = model.base_model
+                
+                layer_grad_stats = {}
+                for name, param in base_model.named_parameters():
+                    if param.grad is not None:
+                        grad_norm = param.grad.norm().item()
+                        grad_max = param.grad.abs().max().item()
+                        grad_mean = param.grad.mean().item()
+                        param_norm = param.data.norm().item()
+                        
+                        # Determine layer type
+                        layer_type = "unknown"
+                        if 'embedding' in name:
+                            layer_type = "embedding"
+                        elif 'gru' in name:
+                            if 'weight_ih' in name:
+                                layer_type = "gru_weight_ih"
+                            elif 'weight_hh' in name:
+                                layer_type = "gru_weight_hh"
+                            elif 'bias' in name:
+                                layer_type = "gru_bias"
+                            else:
+                                layer_type = "gru_other"
+                        elif 'head' in name:
+                            layer_type = "head"
+                        
+                        # Group by layer type
+                        if layer_type not in layer_grad_stats:
+                            layer_grad_stats[layer_type] = {
+                                'names': [],
+                                'grad_norms': [],
+                                'grad_maxs': [],
+                                'grad_means': [],
+                                'param_norms': [],
+                            }
+                        
+                        layer_grad_stats[layer_type]['names'].append(name)
+                        layer_grad_stats[layer_type]['grad_norms'].append(grad_norm)
+                        layer_grad_stats[layer_type]['grad_maxs'].append(grad_max)
+                        layer_grad_stats[layer_type]['grad_means'].append(grad_mean)
+                        layer_grad_stats[layer_type]['param_norms'].append(param_norm)
+                    else:
+                        # No gradient
+                        layer_type = "unknown"
+                        if 'embedding' in name:
+                            layer_type = "embedding"
+                        elif 'gru' in name:
+                            layer_type = "gru"
+                        elif 'head' in name:
+                            layer_type = "head"
+                        
+                        if layer_type not in layer_grad_stats:
+                            layer_grad_stats[layer_type] = {
+                                'names': [],
+                                'grad_norms': [],
+                                'grad_maxs': [],
+                                'grad_means': [],
+                                'param_norms': [],
+                            }
+                        layer_grad_stats[layer_type]['names'].append(name)
+                        layer_grad_stats[layer_type]['grad_norms'].append(0.0)
+                        layer_grad_stats[layer_type]['grad_maxs'].append(0.0)
+                        layer_grad_stats[layer_type]['grad_means'].append(0.0)
+                        layer_grad_stats[layer_type]['param_norms'].append(param.data.norm().item())
+                
+                # Print statistics by layer type
+                for layer_type in sorted(layer_grad_stats.keys()):
+                    stats = layer_grad_stats[layer_type]
+                    if not stats['names']:
+                        continue
+                    
+                    avg_grad_norm = np.mean(stats['grad_norms'])
+                    max_grad_norm = np.max(stats['grad_norms'])
+                    avg_grad_max = np.mean(stats['grad_maxs'])
+                    avg_grad_mean = np.mean(stats['grad_means'])
+                    zero_grad_count = sum(1 for n in stats['grad_norms'] if n < 1e-8)
+                    
+                    status = "✓" if avg_grad_norm > 1e-6 else "✗"
+                    print(f"{status} {layer_type:20s}: "
+                          f"avg_grad_norm={avg_grad_norm:.2e}, "
+                          f"max_grad_norm={max_grad_norm:.2e}, "
+                          f"avg_grad_max={avg_grad_max:.2e}, "
+                          f"zero_grad_layers={zero_grad_count}/{len(stats['names'])}")
+                    
+                    # Print individual layer details for GRU (to see which gates are blocked)
+                    if 'gru' in layer_type and epoch == 0:
+                        for name, grad_norm in zip(stats['names'], stats['grad_norms']):
+                            gate_info = ""
+                            if 'weight_ih' in name or 'weight_hh' in name:
+                                # GRU weights are organized as [reset, update, candidate] gates
+                                # Each gate is hidden_size rows
+                                gate_info = " (gates: reset, update, candidate)"
+                            
+                            grad_status = "✓" if grad_norm > 1e-6 else "✗ BLOCKED"
+                            print(f"    {grad_status} {name}: grad_norm={grad_norm:.2e}{gate_info}")
+                
+                print("=" * 80)
+            
             # Check for gradient explosion
             if grad_norm > 1e6:
                 logger.warning(f"Large gradient norm detected: {grad_norm:.2e} at epoch {epoch}, batch {batch_idx}")
                 # Clip gradients to prevent explosion
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if use_amp:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         
-        optimizer.step()
+        # Optimizer step with gradient scaling
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         
         # Compute update statistics (weight change after optimizer.step())
         if weights_before:
@@ -1815,6 +1833,26 @@ def _train_hat(
                 all_updates = torch.cat(updates)
                 update_std = all_updates.std().item()
                 update_stds.append(update_std)
+            
+            # ViT/GRU: Collect tier-based update norms
+            if is_vit and compute_update_norm_by_tier is not None:
+                tier_updates = compute_update_norm_by_tier(model, weights_before)
+                for tier, norm in tier_updates.items():
+                    if tier in tier_update_norms:
+                        tier_update_norms[tier].append(norm)
+            elif is_gru and gru_compute_update_norm_by_tier is not None:
+                tier_updates = gru_compute_update_norm_by_tier(model, weights_before)
+                for tier, norm in tier_updates.items():
+                    if tier in tier_update_norms:
+                        tier_update_norms[tier].append(norm)
+        
+        # ViT/GRU: Compute logit margin
+        if is_vit and compute_logit_margin is not None:
+            margin_stats = compute_logit_margin(output.detach())
+            logit_margins.append(margin_stats.get('mean', 0.0))
+        elif is_gru and gru_compute_logit_margin is not None:
+            margin_stats = gru_compute_logit_margin(output.detach())
+            logit_margins.append(margin_stats.get('mean', 0.0))
         
         acc1 = accuracy(output, target, topk=(1,))[0]
         losses.update(loss.item(), data.size(0))
@@ -1826,7 +1864,13 @@ def _train_hat(
     std_grad_norm = np.std(grad_norms) if grad_norms else 0.0
     avg_update_std = np.mean(update_stds) if update_stds else 0.0
     
-    return {
+    # Remove activation hooks
+    if hook_handles:
+        for handle in hook_handles:
+            handle.remove()
+    
+    # Build return dictionary
+    result = {
         'loss': losses.avg, 
         'acc1': top1.avg,
         'grad_norm': avg_grad_norm,
@@ -1834,6 +1878,38 @@ def _train_hat(
         'grad_var': avg_grad_var,
         'update_std': avg_update_std,
     }
+    
+    # Add ViT-specific metrics
+    if is_vit:
+        # Tier-based gradient norms
+        for tier, norms in tier_grad_norms.items():
+            if norms:
+                result[f'grad_norm_{tier}'] = np.mean(norms)
+        
+        # Tier-based update norms
+        for tier, norms in tier_update_norms.items():
+            if norms:
+                result[f'update_norm_{tier}'] = np.mean(norms)
+        
+        # Logit margin
+        if logit_margins:
+            result['logit_margin_mean'] = np.mean(logit_margins)
+            result['logit_margin_std'] = np.std(logit_margins)
+        
+        # Activation statistics (collected from hooks)
+        if activation_hooks:
+            if is_vit and collect_activation_stats is not None:
+                act_stats = collect_activation_stats(model, activation_hooks)
+                for tier, stats in act_stats.items():
+                    for stat_name, stat_value in stats.items():
+                        result[f'act_{tier}_{stat_name}'] = stat_value
+            elif is_gru and gru_collect_activation_stats is not None:
+                act_stats = gru_collect_activation_stats(model, activation_hooks)
+                for tier, stats in act_stats.items():
+                    for stat_name, stat_value in stats.items():
+                        result[f'act_{tier}_{stat_name}'] = stat_value
+    
+    return result
 
 
 def _validate_baseline(
@@ -1841,17 +1917,36 @@ def _validate_baseline(
     val_loader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
+    amp_dtype: Optional[torch.dtype] = None,
+    is_gru: bool = False,
 ) -> Dict[str, float]:
     """Standard validation without memristor non-idealities."""
     model.eval()
     losses = AverageMeter('Loss', ':.4f')
     top1 = AverageMeter('Acc@1', ':6.2f')
     
+    use_amp = amp_dtype is not None
+    
     with torch.no_grad():
-        for data, target in val_loader:
+        for batch in val_loader:
+            data, target, lengths = _unpack_batch(batch, is_agnews=is_gru)
             data, target = data.to(device), target.to(device)
-            output = model(data)
-            loss = criterion(output, target)
+            if lengths is not None:
+                lengths = lengths.to(device)
+            
+            if use_amp:
+                with torch.amp.autocast('cuda', dtype=amp_dtype):
+                    if is_gru and lengths is not None:
+                        output = model(data, lengths=lengths)
+                    else:
+                        output = model(data)
+                    loss = criterion(output, target)
+            else:
+                if is_gru and lengths is not None:
+                    output = model(data, lengths=lengths)
+                else:
+                    output = model(data)
+                loss = criterion(output, target)
             
             acc1 = accuracy(output, target, topk=(1,))[0]
             losses.update(loss.item(), data.size(0))
@@ -1867,6 +1962,8 @@ def _validate_memristor(
     device: torch.device,
     device_model: MemristorDeviceModel,
     t: Optional[int] = None,
+    amp_dtype: Optional[torch.dtype] = None,
+    is_gru: bool = False,
 ) -> Dict[str, float]:
     """
     Validation with memristor non-idealities applied.
@@ -1874,6 +1971,7 @@ def _validate_memristor(
     Args:
         t: Drift time for evaluation. If None, uses t_fixed from post_train config
            (stored in run_experiment._post_train_t_fixed), or 0 if not available.
+        is_gru: Whether model is GRU (AG News), for unpacking batch and passing lengths.
     
     Note: Each forward pass will apply non-idealities with different random noise
     (unless seed is fixed). This simulates realistic memristor behavior where
@@ -1901,20 +1999,42 @@ def _validate_memristor(
     if hasattr(device_model, 'drift_time_mode') and device_model.drift_time_mode == 'accumulate':
         device_model.reset_inference_count()
     
+    use_amp = amp_dtype is not None
+    
     with torch.no_grad():
-        for batch_idx, (data, target) in enumerate(val_loader):
+        for batch in val_loader:
+            data, target, lengths = _unpack_batch(batch, is_agnews=is_gru)
             data, target = data.to(device), target.to(device)
+            if lengths is not None:
+                lengths = lengths.to(device)
             
             # Forward with non-idealities
-            # Use eval_t which matches mapping_net training t (when use_random_t=False)
             # Don't use seed here to allow natural randomness in non-idealities
-            try:
-                output = model(data, t=eval_t, seed=None)
-            except TypeError:
-                # Fallback if model doesn't accept t parameter
-                output = model(data)
-            
-            loss = criterion(output, target)
+            if use_amp:
+                with torch.amp.autocast('cuda', dtype=amp_dtype):
+                    try:
+                        if is_gru and lengths is not None:
+                            output = model(data, lengths=lengths, t=eval_t, seed=None)
+                        else:
+                            output = model(data, t=eval_t, seed=None)
+                    except TypeError:
+                        if is_gru and lengths is not None:
+                            output = model(data, lengths=lengths)
+                        else:
+                            output = model(data)
+                    loss = criterion(output, target)
+            else:
+                try:
+                    if is_gru and lengths is not None:
+                        output = model(data, lengths=lengths, t=eval_t, seed=None)
+                    else:
+                        output = model(data, t=eval_t, seed=None)
+                except TypeError:
+                    if is_gru and lengths is not None:
+                        output = model(data, lengths=lengths)
+                    else:
+                        output = model(data)
+                loss = criterion(output, target)
             
             acc1 = accuracy(output, target, topk=(1,))[0]
             losses.update(loss.item(), data.size(0))

@@ -18,7 +18,7 @@ def main():
     train_parser = subparsers.add_parser('train', help='Train a model')
     train_parser.add_argument('--config', type=str, required=True, help='Path to config YAML file')
     train_parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
-    train_parser.add_argument('--compensation', type=str, default=None, choices=['hat', 'learned_mapping'],
+    train_parser.add_argument('--compensation', type=str, default=None, choices=['hat'],
                               help='Compensation method (overrides config)')
     train_parser.add_argument('--output-dir', type=str, default=None, help='Output directory (overrides config)')
     

@@ -27,26 +27,8 @@ optimizer:
 scheduler:
   type: cosine
 
-memristor:
-  G_min: 1e-6
-  G_max: 1e-4
-  weight_clip: [-1.0, 1.0]
-  variability_sigma: 0.05
-  read_noise_sigma: 1e-7
-  drift_alpha: 1e-4
-  stuck_ratio: 0.0
-  stuck_low_prob: 0.5
-  ir_drop_beta: 0.0
-  mapping: linear
-
 experiment:
   mode: baseline
-  compensation_method: hat
-  energy_estimation: false
-  energy_params:
-    subarray_size: 128
-    num_subarrays: 1
-    technology_node_nm: 45
 
 logging:
   use_wandb: false

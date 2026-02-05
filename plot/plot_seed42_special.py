@@ -82,10 +82,10 @@ if 'ADC_direct' in data_comp_seed42 and 'ADC_STE' in data_comp_seed42:
     adc_ste = data_comp_seed42['ADC_STE']
     
     x_direct = np.array(adc_direct['noise_strengths'])
-    y_direct = np.array(adc_direct['final_accuracies'])
+    y_direct = np.array(adc_direct['val_accuracies'])
     
     x_ste = np.array(adc_ste['noise_strengths'])
-    y_ste = np.array(adc_ste['final_accuracies'])
+    y_ste = np.array(adc_ste['val_accuracies'])
     
     # 绘制折线图
     ax.plot(x_direct, y_direct, marker='s', markersize=8, linewidth=2, 
@@ -107,7 +107,7 @@ if 'ADC_direct' in data_comp_seed42 and 'ADC_STE' in data_comp_seed42:
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='none'))
     
     # 添加Y=90.05%的虚线
-    ax.axhline(y=90.05, color='gray', linestyle='--', linewidth=1.5, alpha=0.7, label='_nolegend_')
+    ax.axhline(y=91.04, color='gray', linestyle='--', linewidth=1.5, alpha=0.7, label='_nolegend_')
     
     # 设置标题和标签
     #ax.set_title('ADC Direct vs ADC STE', fontsize=20, fontweight='bold', fontfamily='serif')
@@ -134,15 +134,15 @@ if 'ADC_direct' in data_comp_seed42 and 'ADC_STE' in data_comp_seed42:
     ax.set_xticklabels(labels)
     
     # 设置Y轴刻度：从20到100，每20一个，加上90.05
-    y_ticks = [20, 40, 60, 80, 90.05, 100]
+    y_ticks = [20, 40, 60, 80, 91.04, 100]
     y_ticks = [tick for tick in y_ticks if y_min <= tick <= y_max]
     ax.set_yticks(y_ticks)
     
     # 格式化Y轴标签
     y_tick_labels = []
     for tick in y_ticks:
-        if tick == 90.05:
-            y_tick_labels.append('90.05')
+        if tick == 91.04:
+            y_tick_labels.append('91.04')
         elif tick == int(tick):
             y_tick_labels.append(str(int(tick)))
         else:
@@ -177,10 +177,10 @@ if 'IR_drop_paper' in data_comp_seed42 and 'IR_drop_paper' in data_no_comp_seed4
     ir_drop_no_comp = data_no_comp_seed42['IR_drop_paper']
     
     x_comp = np.array(ir_drop_comp['noise_strengths'])
-    y_comp = np.array(ir_drop_comp['final_accuracies'])
+    y_comp = np.array(ir_drop_comp['val_accuracies'])
     
     x_no_comp = np.array(ir_drop_no_comp['noise_strengths'])
-    y_no_comp = np.array(ir_drop_no_comp['final_accuracies'])
+    y_no_comp = np.array(ir_drop_no_comp['val_accuracies'])
     
     # 绘制折线图
     ax.plot(x_comp, y_comp, marker='s', markersize=8, linewidth=2, 
@@ -202,7 +202,7 @@ if 'IR_drop_paper' in data_comp_seed42 and 'IR_drop_paper' in data_no_comp_seed4
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.7, edgecolor='none'))
     
     # 添加Y=90.05%的虚线
-    ax.axhline(y=90.05, color='gray', linestyle='--', linewidth=1.5, alpha=0.7, label='_nolegend_')
+    ax.axhline(y=91.04, color='gray', linestyle='--', linewidth=1.5, alpha=0.7, label='_nolegend_')
     
     # 设置标题和标签
     #ax.set_title('IR Drop (Paper)', fontsize=20, fontweight='bold', fontfamily='serif')
@@ -229,15 +229,15 @@ if 'IR_drop_paper' in data_comp_seed42 and 'IR_drop_paper' in data_no_comp_seed4
     ax.set_xticklabels(labels)
     
     # 设置Y轴刻度：从20到100，每20一个，加上90.05
-    y_ticks = [20, 40, 60, 80, 90.05, 100]
+    y_ticks = [20, 40, 60, 80, 91.04, 100]
     y_ticks = [tick for tick in y_ticks if y_min <= tick <= y_max]
     ax.set_yticks(y_ticks)
     
     # 格式化Y轴标签
     y_tick_labels = []
     for tick in y_ticks:
-        if tick == 90.05:
-            y_tick_labels.append('90.05')
+        if tick == 91.04:
+            y_tick_labels.append('91.04')
         elif tick == int(tick):
             y_tick_labels.append(str(int(tick)))
         else:

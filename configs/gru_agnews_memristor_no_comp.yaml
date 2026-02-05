@@ -1,0 +1,110 @@
+# GRU AG News with memristor (no compensation)
+
+experiment_name: gru_agnews_memristor_no_comp
+seed: 42
+device: cuda
+
+dataset: agnews
+data_root: ./datasets/agnews
+num_classes: 4
+val_split: 0.1
+
+model_name: gru_agnews
+
+# GRU model architecture parameters
+embed_dim: 128  # Embedding dimension
+hidden_dim: 256  # Hidden dimension
+num_layers: 2  # Number of GRU layers
+
+batch_size: 128
+epochs: 5
+num_workers: 8
+eval_interval: 1
+save_interval: 10
+
+# Performance optimizations
+use_torch_compile: false
+
+# Optimizer
+optimizer:
+  type: adam
+  lr: 0.001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+scheduler:
+  type: cosine
+  warmup_epochs: 5
+
+# Mixed precision training
+mixed_precision: false
+
+memristor:
+  G_min: 1e-6
+  G_max: 1e-3
+  weight_clip: [-1.0, 1.0]
+  variability_sigma: 0.1
+  read_noise_sigma: 1e-7
+  drift_alpha: 1e-4
+  stuck_ratio: 0.1
+  stuck_low_prob: 0.5
+  ir_drop_beta: 0.1
+  mapping: linear
+  # IR-drop model parameters
+  ir_drop_mode: crossbar  # options: none | simple | paper | crossbar
+  ir_drop_gamma: 0.35
+  ir_drop_scaling: 1.0
+  # crossbar mode parameters
+  ir_drop_eta: 1.0
+  ir_drop_cap: 0.10
+  ir_drop_norm: mean
+  # Drift time mode
+  drift_time_mode: accumulate  # 'fixed' or 'accumulate'
+  drift_time_fixed: 0
+  # Array size and ADC
+  array_size: 128
+  adc_bits: 8
+  enable_update_model: false
+  enable_adc: true
+  adc_add_noise: false
+  enable_energy: false
+  # Update model parameters
+  update_params:
+    A_plus: 1e-5
+    A_minus: 1e-5
+    p_plus: 1.0
+    p_minus: 1.0
+    gamma: 1.0
+    write_noise_ratio: 0.05
+  # Energy coefficients
+  energy_coefs:
+    alpha: 1.0
+    beta: 1.0
+  # Training noise injection control
+  enable_adc_during_training: false
+  adc_training_mode: direct
+  enable_ir_drop_paper_during_training: false
+  # Synthetic noise type configuration
+  # Options: 'none' | 'full_variability' | 'cond1_variance_bounded' | 'cond2_gradient_unbiased' | 'cond3_adc_direct'
+  synthetic_noise_type: none  # Set to desired noise type
+  # cond.1 variance bounded noise parameters
+  cond1_alpha: 0.1
+  cond1_nu: 2.0
+  # cond.2 gradient unbiased noise parameters
+  cond2_alpha: 0.1
+
+experiment:
+  mode: memristor_no_comp
+  compensation_method: hat
+  noise_sampling_interval: 1
+  energy_estimation: false
+  energy_params:
+    subarray_size: 128
+    num_subarrays: 1
+    technology_node_nm: 45
+
+logging:
+  use_wandb: false
+  project_name: memristor-nn
+  run_name: gru_agnews_memristor_no_comp

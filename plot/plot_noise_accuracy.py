@@ -157,7 +157,7 @@ for noise_type in noise_types:
 
 
     # 添加Y=90.05%的虚线
-    ax.axhline(y=90.05, color='gray', linestyle='--', linewidth=1.5, alpha=0.7, label='_nolegend_')
+    ax.axhline(y=91.04, color='gray', linestyle='--', linewidth=1.5, alpha=0.7, label='_nolegend_')
     
     # 设置标题和标签
     #ax.set_title(noise_names_en[noise_type], fontsize=20, fontweight='bold', fontfamily='serif')
@@ -193,6 +193,22 @@ for noise_type in noise_types:
             # drift_alpha使用 n×10^{-m} 格式
             labels = [format_scientific_label(x) for x in all_x_values]
             ax.set_xticklabels(labels)
+        elif noise_type == 'IR_drop_crossbar':
+            # IR_drop_crossbar保留原始小数位（0, 0.005, 0.01, 0.015）
+            ax.ticklabel_format(style='plain', axis='x')
+            labels = []
+            for x in all_x_values:
+                if x == 0:
+                    labels.append('0')
+                elif x == 0.005:
+                    labels.append('0.005')
+                elif x == 0.01:
+                    labels.append('0.01')
+                elif x == 0.015:
+                    labels.append('0.015')
+                else:
+                    labels.append(f'{x:.3f}')
+            ax.set_xticklabels(labels)
         else:
             # 其他噪声类型：保留2位小数
             ax.ticklabel_format(style='plain', axis='x')
@@ -200,7 +216,7 @@ for noise_type in noise_types:
             ax.set_xticklabels(labels)
     
     # 设置Y轴刻度：从20到100，每20一个，加上90.05
-    y_ticks = [20, 40, 60, 80, 90.05, 100]
+    y_ticks = [20, 40, 60, 80, 91.04, 100]
     # 只保留在Y轴范围内的刻度
     y_ticks = [tick for tick in y_ticks if y_min <= tick <= y_max]
     ax.set_yticks(y_ticks)
@@ -208,8 +224,8 @@ for noise_type in noise_types:
     # 格式化Y轴标签：整数显示为整数，90.05显示为90.05
     y_tick_labels = []
     for tick in y_ticks:
-        if tick == 90.05:
-            y_tick_labels.append('90.05')
+        if tick == 91.04:
+            y_tick_labels.append('91.04')
         elif tick == int(tick):
             y_tick_labels.append(str(int(tick)))
         else:

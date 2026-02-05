@@ -9,3 +9,6 @@ scikit-learn>=1.1.0
 timm>=0.6.0
 wandb>=0.13.0; extra == "wandb"
 pytest>=7.0.0
+# AG News (optional: only needed for dataset agnews)
+datasets>=2.14.0
+tokenizers>=0.15.0

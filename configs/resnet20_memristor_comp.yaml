@@ -1,7 +1,7 @@
 # ResNet-20 with memristor and compensation (HAT)
 
 experiment_name: resnet20_memristor_comp
-seed: 42
+seed: 3407
 device: cuda
 
 dataset: cifar10
@@ -32,7 +32,7 @@ memristor:
   weight_clip: [-1.0, 1.0]
   variability_sigma: 0.1
   read_noise_sigma: 1e-7
-  drift_alpha: 3e-4
+  drift_alpha: 1e-4
   stuck_ratio: 0.1
   stuck_low_prob: 0.5
   mapping: linear
@@ -45,6 +45,7 @@ memristor:
   ir_drop_eta: 1.0  # 位置因子幂次（crossbar模式）
   ir_drop_cap: 0.10  # 单列最大衰减上限（crossbar模式）
   ir_drop_norm: mean  # 列活动归一化方式（crossbar模式）：'mean' 或 'max'
+  ir_drop_train_enabled: true  # crossbar模式下是否在训练时注入IR-drop（true=训练和推理都注入，false=仅推理时注入）
   # 电导漂移时间设置方式
   drift_time_mode: accumulate  # 'fixed' 或 'accumulate'：固定值或模拟真实器件老化（t随推理次数累加）
   drift_time_fixed: 0  # 固定值模式下的t值（仅在drift_time_mode='fixed'时生效）
@@ -54,7 +55,7 @@ memristor:
   enable_adc: true  # 启用ADC量化
   adc_add_noise: false  # ADC量化是否添加噪声
   enable_energy: false  # 启用能耗估计
-  enable_update_model: true # 启用状态依赖写入模型
+  enable_update_model: true  # 启用状态依赖写入模型
   write:
     t_min: 5e-9      # 最小脉冲宽度
     t_scale: 50e-9   # 脉冲时间的放大因子
@@ -74,6 +75,18 @@ memristor:
   energy_coefs:
     alpha: 1.0  # 写入能耗系数 (E_write = alpha * V^2 * t)
     beta: 1.0  # 读出能耗系数 (E_read = beta * 2^bits)
+  # 训练时噪声注入控制（用于研究可学习与不可学习噪声的边界）
+  enable_adc_during_training: false  # 是否在训练时启用ADC量化（默认false，因为会导致梯度消失）
+  adc_training_mode: direct  # ADC训练模式：'ste'（使用Straight-Through Estimator，保持梯度流）或'direct'
+  enable_ir_drop_paper_during_training: false  # 是否在训练时启用paper版IR-drop（默认false，因为可能导致梯度不稳定）
+  # 合成噪声类型配置（用于研究噪声可学习性条件）
+  # 选项: 'none' | 'full_variability' | 'cond1_variance_bounded' | 'cond2_gradient_unbiased' | 'cond3_adc_direct'
+  synthetic_noise_type: none  # 设置为要测试的噪声类型
+  # cond.1 方差有界噪声参数（当 synthetic_noise_type='cond1_variance_bounded' 时生效）
+  cond1_alpha: 0.1  # 可调参数α
+  cond1_nu: 2.0  # t分布自由度ν (ν ≤ 2)
+  # cond.2 梯度无偏噪声参数（当 synthetic_noise_type='cond2_gradient_unbiased' 时生效）
+  cond2_alpha: 0.1  # 可调参数α
 
 experiment:
   mode: memristor_with_comp

@@ -130,6 +130,11 @@ class ViTTiny(nn.Module):
             nn.init.trunc_normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv2d):
+            # Initialize Conv2d (patch embedding) with trunc_normal
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)

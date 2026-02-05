@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-绘制梯度范数图表
+绘制梯度方差图表
 """
 
 import csv
@@ -9,6 +9,7 @@ import numpy as np
 from pathlib import Path
 import glob
 import re
+from matplotlib.ticker import ScalarFormatter, FuncFormatter
 
 # 设置字体 - 使用Times New Roman
 plt.rcParams['font.family'] = 'serif'
@@ -69,21 +70,19 @@ def extract_noise_strength(folder_name, noise_type):
 def read_metrics(csv_path):
     """读取metrics.csv文件"""
     epochs = []
-    grad_norms = []
-    grad_norm_stds = []
+    grad_vars = []
     
     try:
         with open(csv_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 epochs.append(int(row['epoch']))
-                grad_norms.append(float(row['grad_norm']))
-                grad_norm_stds.append(float(row['grad_norm_std']))
+                grad_vars.append(float(row['grad_var']))
     except Exception as e:
         print(f"Error reading {csv_path}: {e}")
-        return None, None, None
+        return None, None
     
-    return np.array(epochs), np.array(grad_norms), np.array(grad_norm_stds)
+    return np.array(epochs), np.array(grad_vars)
 
 def format_noise_strength_label(value, noise_type):
     """格式化噪声强度标签"""
@@ -130,6 +129,18 @@ def format_noise_strength_label(value, noise_type):
         else:
             return f'{value:.2f}'
 
+def scientific_formatter(x, pos):
+    """科学计数法格式化函数"""
+    if x == 0:
+        return '0'
+    exp = int(np.floor(np.log10(abs(x))))
+    coeff = x / (10 ** exp)
+    if abs(coeff - round(coeff)) < 1e-10:
+        coeff_str = str(int(round(coeff)))
+    else:
+        coeff_str = f'{coeff:.1f}'.rstrip('0').rstrip('.')
+    return f'${coeff_str} \\times 10^{{{exp}}}$'
+
 # 为每个噪声类型生成图表
 for noise_type in noise_types:
     noise_dir = base_dir / noise_type
@@ -152,7 +163,7 @@ for noise_type in noise_types:
         if not metrics_file.exists():
             continue
         
-        epochs, grad_norms, grad_norm_stds = read_metrics(metrics_file)
+        epochs, grad_vars = read_metrics(metrics_file)
         if epochs is None:
             continue
         
@@ -162,8 +173,7 @@ for noise_type in noise_types:
         data_list.append({
             'noise_strength': noise_strength,
             'epochs': epochs,
-            'grad_norms': grad_norms,
-            'grad_norm_stds': grad_norm_stds
+            'grad_vars': grad_vars
         })
     
     if len(data_list) == 0:
@@ -179,28 +189,26 @@ for noise_type in noise_types:
     # 绘制每条曲线
     for idx, data in enumerate(data_list):
         epochs = data['epochs']
-        grad_norms = data['grad_norms']
-        grad_norm_stds = data['grad_norm_stds']
+        grad_vars = data['grad_vars']
         noise_strength = data['noise_strength']
         
         color = colors[idx % len(colors)]
         label = format_noise_strength_label(noise_strength, noise_type)
         
-        # 绘制误差带
-        ax.fill_between(epochs, grad_norms - grad_norm_stds, grad_norms + grad_norm_stds,
-                        alpha=0.2, color=color, label='_nolegend_')
-        
         # 绘制折线
-        ax.plot(epochs, grad_norms, linewidth=2, color=color, label=label)
+        ax.plot(epochs, grad_vars, linewidth=2, color=color, label=label)
     
     # 对于ir_drop使用对数坐标
     if noise_type == 'noise_boundary_ir_drop':
         ax.set_yscale('log')
     
+    # 设置Y轴为科学计数法格式
+    ax.yaxis.set_major_formatter(FuncFormatter(scientific_formatter))
+    
     # 设置标题和标签
     #ax.set_title(noise_names[noise_type], fontsize=20, fontweight='bold', fontfamily='serif')
     ax.set_xlabel('Epoch', fontsize=18, fontfamily='serif')
-    ax.set_ylabel('Gradient Norm', fontsize=18, fontfamily='serif')
+    ax.set_ylabel('Gradient Variance', fontsize=18, fontfamily='serif')
     
     # 设置网格
     ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
@@ -221,7 +229,7 @@ for noise_type in noise_types:
     plt.tight_layout()
     
     # 保存图片
-    output_name = noise_type.replace('noise_boundary_', 'grad_norm_')
+    output_name = noise_type.replace('noise_boundary_', 'grad_var_')
     output_path = base_dir / f"{output_name}.png"
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     print(f"图表已保存到: {output_path}")
