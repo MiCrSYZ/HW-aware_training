@@ -139,7 +139,8 @@ class ViTTiny(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
     
-    def forward(self, x):
+    def forward(self, x, **kwargs):
+        # **kwargs (e.g. seed, t) ignored for plain ViT; allows same call as wrapped models
         B = x.shape[0]
         
         # Patch embedding

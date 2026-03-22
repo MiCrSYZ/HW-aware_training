@@ -1,3 +1,4 @@
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -459,9 +460,18 @@ def run_experiment(
         if 'memristor' in config and 'noise_injection' in config['memristor']:
             noise_config = config['memristor']['noise_injection']
         
-        memristor_model = wrap_model_with_memristor(
-            base_model, device_model, noise_config=noise_config
-        )
+        # wrap_model_with_memristor 会就地替换传入模型中的 Linear/Conv2d 为 Memristor 层。
+        # no_comp 要求训练用干净模型、评估用带噪模型，因此 no_comp 时必须包装 base 的深拷贝，
+        # 这样 base_model 保持 nn.Linear/nn.Conv2d，训练时无噪声；评估时用包装后的副本加噪声。
+        if config['experiment']['mode'] == 'memristor_no_comp':
+            base_for_noisy = copy.deepcopy(base_model)
+            memristor_model = wrap_model_with_memristor(
+                base_for_noisy, device_model, noise_config=noise_config
+            )
+        else:
+            memristor_model = wrap_model_with_memristor(
+                base_model, device_model, noise_config=noise_config
+            )
         memristor_model = memristor_model.to(device)
         
         # For memristor_with_comp (HAT), use memristor model for training (with noise + compensation)
@@ -666,8 +676,10 @@ def run_experiment(
     epoch_times = []
     training_start_time = time.time()
     
-    # Debug: Log training loop start
+    # Log training loop start
+    steps_per_epoch = len(train_loader)
     experiment_logger.info(f"Starting training loop: start_epoch={start_epoch}, epochs={epochs}")
+    experiment_logger.info(f"Steps per epoch: {steps_per_epoch} (same for baseline/comp/no_comp)")
     experiment_logger.info(f"Experiment mode: {experiment_mode}")
     
     for epoch in range(start_epoch, epochs):
@@ -726,7 +738,8 @@ def run_experiment(
             )
             # memristor_no_comp 不在此分支内，无需同步
         
-        # Validate
+        # Validate (with timing)
+        eval_start_time = time.perf_counter()
         if val_loader is not None:
             if experiment_mode == 'baseline':
                 val_metrics = _validate_baseline(
@@ -745,6 +758,7 @@ def run_experiment(
                 )
         else:
             val_metrics = {'acc1': 0.0, 'loss': 0.0}
+        eval_time = time.perf_counter() - eval_start_time
         
         # Update learning rate
         if scheduler:
@@ -767,6 +781,10 @@ def run_experiment(
             metrics['grad_var'] = train_metrics.get('grad_var', 0.0)
         if 'update_std' in train_metrics:
             metrics['update_std'] = train_metrics.get('update_std', 0.0)
+        # Timing
+        metrics['data_time_avg'] = train_metrics.get('data_time_avg', 0.0)
+        metrics['train_step_time_avg'] = train_metrics.get('train_step_time_avg', 0.0)
+        metrics['eval_time'] = eval_time
         
         # Add ViT/GRU-specific metrics if available
         is_vit = config.get('model_name', '') == 'vit_tiny'
@@ -874,6 +892,13 @@ def run_experiment(
             log_msg += f" | update_std={metrics['update_std']:.4e}"
         
         log_msg += f" | Time: {epoch_time_str} | ETA: {eta_str}"
+        # Timing breakdown
+        if 'data_time_avg' in metrics and 'train_step_time_avg' in metrics:
+            log_msg += (
+                f" | data_time={metrics['data_time_avg']*1000:.1f}ms"
+                f" | train_step_time={metrics['train_step_time_avg']*1000:.1f}ms"
+                f" | eval_time={metrics.get('eval_time', 0):.2f}s"
+            )
         
         # 如果启用了能耗估计，添加能耗信息
         if device_model and hasattr(device_model, 'enable_energy') and device_model.enable_energy:
@@ -1021,9 +1046,17 @@ def _train_baseline(
     grad_vars = []  # List of gradient variances per batch
     update_stds = []  # List of update standard deviations per batch
     
+    # Timing: data_time (per batch), train_step_time (forward+backward+opt per batch)
+    data_times = []
+    step_times = []
+    
     use_amp = scaler is not None and amp_dtype is not None
     
+    t_prev_end = time.perf_counter()
     for batch_idx, batch in enumerate(train_loader):
+        t_iter_start = time.perf_counter()
+        data_times.append(t_iter_start - t_prev_end)
+        
         data, target, lengths = _unpack_batch(batch, is_agnews=is_gru)
         data, target = data.to(device), target.to(device)
         if lengths is not None:
@@ -1061,6 +1094,7 @@ def _train_baseline(
         
         optimizer.zero_grad()
         
+        t_step_start = time.perf_counter()
         # Mixed precision forward pass (GRU needs lengths for pack_padded_sequence)
         if use_amp:
             with torch.amp.autocast('cuda', dtype=amp_dtype):
@@ -1212,6 +1246,9 @@ def _train_baseline(
         else:
             optimizer.step()
         
+        t_prev_end = time.perf_counter()
+        step_times.append(t_prev_end - t_step_start)
+        
         # Compute update statistics (weight change after optimizer.step())
         if weights_before:
             updates = []
@@ -1237,6 +1274,8 @@ def _train_baseline(
     std_grad_norm = np.std(grad_norms) if grad_norms else 0.0
     avg_update_std = np.mean(update_stds) if update_stds else 0.0
     
+    avg_data_time = np.mean(data_times) if data_times else 0.0
+    avg_step_time = np.mean(step_times) if step_times else 0.0
     return {
         'loss': losses.avg, 
         'acc1': top1.avg,
@@ -1244,6 +1283,8 @@ def _train_baseline(
         'grad_norm_std': std_grad_norm,
         'grad_var': avg_grad_var,
         'update_std': avg_update_std,
+        'data_time_avg': avg_data_time,
+        'train_step_time_avg': avg_step_time,
     }
 
 
@@ -1254,14 +1295,20 @@ def _sync_weights_to_memristor_model(base_model: nn.Module, memristor_model: nn.
     This is needed for memristor_no_comp mode where we train the base model
     but evaluate with the memristor-wrapped model.
     
-    The memristor_model has MemristorLinear/MemristorConv2d layers that wrap
-    the original layers. We need to copy weights from base_model's layers to
-    the corresponding memristor layers.
+    After removing deepcopy, base_model and memristor_model.base_model are the same object,
+    so sync is a no-op (weights are already shared). This function includes a fast path
+    to skip unnecessary work when they're the same object.
     
     Args:
         base_model: Base model (trained without non-idealities)
         memristor_model: Memristor-wrapped model (for evaluation)
     """
+    # Fast path: if base_model and memristor_model.base_model are the same object,
+    # weights are already shared, no sync needed
+    if hasattr(memristor_model, 'base_model') and base_model is memristor_model.base_model:
+        # Same object - weights are already shared, sync is a no-op
+        return
+    
     # Get the wrapped base_model from memristor_model
     if not hasattr(memristor_model, 'base_model'):
         # If memristor_model doesn't have base_model attribute, try direct sync
@@ -1558,6 +1605,10 @@ def _train_hat(
     activation_hooks = None
     hook_handles = []
     
+    # Timing: data_time (per batch), train_step_time (forward+backward+opt per batch)
+    data_times = []
+    step_times = []
+    
     use_amp = scaler is not None and amp_dtype is not None
     
     # Register activation hooks for ViT/GRU if available
@@ -1566,7 +1617,11 @@ def _train_hat(
     elif is_gru and gru_register_activation_hooks is not None:
         activation_hooks, hook_handles = gru_register_activation_hooks(model)
     
+    t_prev_end = time.perf_counter()
     for batch_idx, batch in enumerate(train_loader):
+        t_iter_start = time.perf_counter()
+        data_times.append(t_iter_start - t_prev_end)
+        
         data, target, lengths = _unpack_batch(batch, is_agnews=is_gru)
         data, target = data.to(device), target.to(device)
         if lengths is not None:
@@ -1580,6 +1635,7 @@ def _train_hat(
         
         optimizer.zero_grad()
         
+        t_step_start = time.perf_counter()
         # Forward with non-idealities (t increases with each batch)
         t = epoch * len(train_loader) + batch_idx
         
@@ -1629,6 +1685,7 @@ def _train_hat(
         # Check for NaN in output
         if torch.isnan(output).any():
             logger.warning(f"NaN detected in output at epoch {epoch}, batch {batch_idx}. Skipping batch.")
+            t_prev_end = time.perf_counter()
             continue
         
         # Mixed precision loss computation
@@ -1641,6 +1698,7 @@ def _train_hat(
         # Check for NaN in loss
         if torch.isnan(loss_task) or torch.isinf(loss_task):
             logger.warning(f"NaN/Inf detected in loss at epoch {epoch}, batch {batch_idx}. Skipping batch.")
+            t_prev_end = time.perf_counter()
             continue
         
         # Boundary regularization (if enabled)
@@ -1819,6 +1877,9 @@ def _train_hat(
         else:
             optimizer.step()
         
+        t_prev_end = time.perf_counter()
+        step_times.append(t_prev_end - t_step_start)
+        
         # Compute update statistics (weight change after optimizer.step())
         if weights_before:
             updates = []
@@ -1869,6 +1930,8 @@ def _train_hat(
         for handle in hook_handles:
             handle.remove()
     
+    avg_data_time = np.mean(data_times) if data_times else 0.0
+    avg_step_time = np.mean(step_times) if step_times else 0.0
     # Build return dictionary
     result = {
         'loss': losses.avg, 
@@ -1877,6 +1940,8 @@ def _train_hat(
         'grad_norm_std': std_grad_norm,
         'grad_var': avg_grad_var,
         'update_std': avg_update_std,
+        'data_time_avg': avg_data_time,
+        'train_step_time_avg': avg_step_time,
     }
     
     # Add ViT-specific metrics

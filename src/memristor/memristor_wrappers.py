@@ -150,11 +150,16 @@ def hardware_linear_forward_adaptive(
     # Only apply ADC if noise is enabled (ADC is part of noise injection)
     
     # 对于cond3_adc_direct，需要强制启用ADC
+    # IMPORTANT: For cond1/cond2, do NOT apply ADC (only cond3 uses ADC)
+    # For 'none'/'full_variability', apply ADC based on enable_noise and enable_adc config
     # 初始化 enable_adc_during_training，避免在日志中引用未赋值变量
     enable_adc_during_training = False
     if synthetic_noise_type == 'cond3_adc_direct':
         should_apply_adc = True  # cond3总是应用ADC
+    elif synthetic_noise_type in ['cond1_variance_bounded', 'cond2_gradient_unbiased']:
+        should_apply_adc = False  # cond1和cond2不应用ADC
     elif enable_noise and hasattr(device_model, "enable_adc") and device_model.enable_adc:
+        # Only apply ADC for 'none' or 'full_variability' modes
         enable_adc_during_training = getattr(device_model, "enable_adc_during_training", False)
         should_apply_adc = not training or enable_adc_during_training
     else:
@@ -193,7 +198,14 @@ def hardware_linear_forward_adaptive(
     # Apply new IR-drop correction based on paper equations (16)-(18) if enabled
     # Apply IR-drop if enabled and (inference OR training with enable_ir_drop_paper_during_training)
     # Only apply IR-drop if noise is enabled (IR-drop is part of noise injection)
-    if enable_noise and device_model.ir_drop_mode == "paper":
+    # IMPORTANT: Do NOT apply IR-drop when synthetic_noise_type is set (cond1/cond2/cond3/full_variability)
+    # IR-drop should only be applied when synthetic_noise_type is 'none' (default mode)
+    should_apply_ir_drop = (
+        enable_noise and 
+        device_model.ir_drop_mode == "paper" and
+        synthetic_noise_type == 'none'  # Only apply IR-drop when no synthetic noise is used
+    )
+    if should_apply_ir_drop:
         should_apply_ir = not training or (hasattr(device_model, "enable_ir_drop_paper_during_training") and device_model.enable_ir_drop_paper_during_training)
         if should_apply_ir:
             # Compute normalization factors with numerical stability protection

@@ -15,6 +15,7 @@ try:
     from ..memristor.memristor_wrappers import MemristorLinear, MemristorConv2d
     from ..memristor.memristor_gru import MemristorGRU
     from ..memristor.device_model import MemristorDeviceModel
+    from ..memristor.synth_noise_wrappers import SynthNoiseLinear, SynthNoiseConv2d, SynthNoiseConfig
 except ImportError:
     from src.models.resnet20 import ResNet20
     from src.models.vit_tiny import ViTTiny
@@ -22,6 +23,7 @@ except ImportError:
     from src.memristor.memristor_wrappers import MemristorLinear, MemristorConv2d
     from src.memristor.memristor_gru import MemristorGRU
     from src.memristor.device_model import MemristorDeviceModel
+    from src.memristor.synth_noise_wrappers import SynthNoiseLinear, SynthNoiseConv2d, SynthNoiseConfig
 
 
 def get_model(
@@ -88,40 +90,91 @@ def _should_inject_noise_for_layer(
     if noise_config is None:
         return True
     
+    # Helper: get enable from section that can be bool or dict with enable_noise/enable
+    def _get_enable_resnet(section: Any) -> bool:
+        if section is None:
+            return True
+        if isinstance(section, bool):
+            return section
+        if isinstance(section, dict):
+            return bool(section.get('enable_noise', section.get('enable', True)))
+        return True
+    
+    # ResNet (CIFAR ResNet20: stem=conv1, layer1/layer2/layer3, head=linear)
+    if full_name == 'conv1' and layer_type == 'conv2d':
+        return _get_enable_resnet(noise_config.get('stem'))
+    if full_name == 'linear' and layer_type == 'linear':
+        return _get_enable_resnet(noise_config.get('head'))
+    # ResNet shortcut (1x1 conv in layer2.0 / layer3.0): when disabled, keeps residual path clean (ablation)
+    if 'shortcut' in full_name and layer_type == 'conv2d':
+        sc = noise_config.get('shortcut')
+        if sc is False:
+            return False
+        if isinstance(sc, dict) and not _get_enable_resnet(sc):
+            return False
+    if 'layer1' in full_name:
+        return _get_enable_resnet(noise_config.get('layer1'))
+    if 'layer2' in full_name:
+        return _get_enable_resnet(noise_config.get('layer2'))
+    if 'layer3' in full_name:
+        return _get_enable_resnet(noise_config.get('layer3'))
+    # 仅当配置为“纯 ResNet”时，未匹配到的层（如 bn/avgpool）才 return False；
+    # 若配置里同时有 ViT 键（patch_embed/attn/mlp），说明是 ViT，不要在这里 return False，交给下面 ViT 分支
+    if any(k in noise_config for k in ('stem', 'layer1', 'layer2', 'layer3', 'head')):
+        if not any(k in noise_config for k in ('patch_embed', 'attn', 'mlp')):
+            return False
+
+    # Helper: prefer generic enable_noise/enable (for synth), fallback to enable_ir_drop (memristor)
+    def _get_enable(cfg: dict, key_ir_drop: str, key_adc: str = None) -> bool:
+        if not cfg:
+            return True
+        # Synth / generic keys (no IR-drop/ADC naming)
+        if 'enable_noise' in cfg:
+            return cfg.get('enable_noise', True)
+        if 'enable' in cfg:
+            return cfg.get('enable', True)
+        # Memristor keys
+        v = cfg.get(key_ir_drop, True)
+        if v is not None:
+            return v
+        if key_adc is not None:
+            return cfg.get(key_adc, True)
+        return True
+
     # Check patch_embed (Conv2d)
     if 'patch_embed' in full_name and layer_type == 'conv2d':
         patch_config = noise_config.get('patch_embed', {})
-        # If patch_embed config exists, check enable_ir_drop (IR-drop is the main noise for MVM)
         if patch_config:
-            return patch_config.get('enable_ir_drop', True)
-        return True  # Default to True if config section exists but key missing
+            return _get_enable(patch_config, 'enable_ir_drop', 'enable_adc')
+        return True
     
     # Check attention layers (Linear)
     if 'attn' in full_name and layer_type == 'linear':
         attn_config = noise_config.get('attn', {})
         if attn_config:
-            # Check specific attention layer types
             if 'qkv' in full_name:
-                # Q/K/V projection: check enable_adc_qkv (ADC量化对Q/K/V的输出)
-                return attn_config.get('enable_adc_qkv', True)
+                return attn_config.get('enable_noise_qkv', attn_config.get('enable_adc_qkv', True))
             elif 'proj' in full_name:
-                # Output projection (W_o): check enable_ir_drop_w_o (IR-drop优先注入到W_o)
-                return attn_config.get('enable_ir_drop_w_o', True)
+                return attn_config.get('enable_noise_w_o', attn_config.get('enable_ir_drop_w_o', True))
             else:
-                # Other attention layers: default to False (only qkv and proj should have noise)
                 return False
-        return True  # Default to True if config section exists but key missing
+        return True
     
     # Check MLP layers (Linear)
     if 'mlp' in full_name and layer_type == 'linear':
         mlp_config = noise_config.get('mlp', {})
         if mlp_config:
-            # Check enable_ir_drop for MLP layers
-            return mlp_config.get('enable_ir_drop', True)
-        return True  # Default to True if config section exists but key missing
+            return _get_enable(mlp_config, 'enable_ir_drop', 'enable_adc')
+        return True
     
-    # For other layers (e.g., head), default to False (no noise injection)
-    # This ensures only A, B, C locations get noise by default
+    # ViT classification head (same as ResNet head: allow configurable injection)
+    if full_name == 'head' and layer_type == 'linear':
+        head_cfg = noise_config.get('head')
+        if head_cfg is None:
+            return True  # default: inject so ViT "all layers" matches ResNet
+        return _get_enable_resnet(head_cfg) if isinstance(head_cfg, dict) else bool(head_cfg)
+    
+    # Other layers (e.g. norm, non-matched names): no noise
     return False
 
 
@@ -284,10 +337,9 @@ def wrap_model_with_memristor(
                     return module(x)
     
     wrapped_model = MemristorModel(model, device_model)
-    
-    # DEBUG CODE COMMENTED OUT
-    # # Debug: Print all modules with mapping_net attribute
-    # # Check both wrapped_model.modules() and wrapped_model.base_model.modules()
+
+    # Debug: Print all modules with mapping_net attribute
+    # Check both wrapped_model.modules() and wrapped_model.base_model.modules()
     # print("\n" + "=" * 60)
     # print("DEBUG: Checking mapping_net in wrapped model")
     # print("=" * 60)
@@ -356,5 +408,136 @@ def wrap_model_with_memristor(
     # 
     # print("=" * 60 + "\n")
     
+    return wrapped_model
+
+
+def wrap_model_with_synth_noise(
+    model: nn.Module,
+    config: SynthNoiseConfig,
+    noise_config: Optional[Dict[str, Any]] = None,
+) -> nn.Module:
+    """
+    Wrap a model's layers with synthetic noise-aware versions.
+    
+    This function recursively replaces nn.Linear and nn.Conv2d layers
+    with SynthNoiseLinear and SynthNoiseConv2d equivalents.
+    Unlike memristor wrapping, this does NOT use weight-to-conductance mapping.
+    
+    Args:
+        model: Base model to wrap
+        config: SynthNoiseConfig instance
+        noise_config: Optional noise injection configuration dict from config file.
+                     If None, all layers get noise (backward compatibility).
+                     ResNet: stem, layer1, layer2, layer3, head (each true/false or {enable_noise: bool}).
+                     ViT: patch_embed, attn, mlp with enable_noise / enable_* keys.
+        
+    Returns:
+        Model with synthetic noise-aware layers
+    """
+    def _replace_in_module(module, parent_name=''):
+        """
+        Recursively replace Linear and Conv2d layers with synth noise versions.
+        
+        Args:
+            module: Module to process (will be modified in-place)
+            parent_name: Full name of parent module (for building full layer names)
+        """
+        # Get all direct children (not recursive)
+        for name, child in list(module.named_children()):
+            # Build full name for this layer
+            full_name = f"{parent_name}.{name}" if parent_name else name
+            
+            if isinstance(child, nn.Linear):
+                # Determine if noise should be injected for this layer
+                enable_noise = _should_inject_noise_for_layer(full_name, 'linear', noise_config)
+                # Replace Linear layer
+                setattr(module, name, SynthNoiseLinear(child, config, enable_noise=enable_noise))
+            elif isinstance(child, nn.Conv2d):
+                # Determine if noise should be injected for this layer
+                enable_noise = _should_inject_noise_for_layer(full_name, 'conv2d', noise_config)
+                # Replace Conv2d layer
+                setattr(module, name, SynthNoiseConv2d(child, config, enable_noise=enable_noise))
+            else:
+                # Recursively process child modules (Sequential, ModuleList, BasicBlock, etc.)
+                _replace_in_module(child, full_name)
+    
+    # In-place replace: modify the given model
+    _replace_in_module(model, parent_name='')
+    
+    class SynthNoiseModel(nn.Module):
+        def __init__(self, base_model, config):
+            super().__init__()
+            self.config = config
+            self.base_model = base_model  # same reference (already in-place replaced above)
+        
+        def forward(self, x, seed=None, lengths=None):
+            """Forward pass with optional seed for reproducibility."""
+            # Inject runtime seed so SynthNoise layers still receive deterministic
+            # seed even when parent modules' forward() signatures do not accept seed.
+            prev_runtime_seed = getattr(self.config, "_runtime_seed", None)
+            self.config._runtime_seed = seed
+            try:
+                # For GRU models, pass lengths if available
+                if lengths is not None:
+                    return self._forward_with_lengths(self.base_model, x, seed, lengths)
+                else:
+                    return self._forward_with_seed(self.base_model, x, seed)
+            finally:
+                self.config._runtime_seed = prev_runtime_seed
+        
+        def _forward_with_seed(self, module, x, seed):
+            """Recursively forward with seed parameter where supported."""
+            if isinstance(module, SynthNoiseLinear) or isinstance(module, SynthNoiseConv2d):
+                return module(x, seed=seed)
+            elif isinstance(module, nn.Sequential):
+                for m in module:
+                    x = self._forward_with_seed(m, x, seed)
+                return x
+            elif isinstance(module, nn.ModuleList):
+                for m in module:
+                    x = self._forward_with_seed(m, x, seed)
+                return x
+            else:
+                # For other modules, try to forward with seed if supported
+                if hasattr(module, 'forward'):
+                    forward_code = module.forward.__code__
+                    forward_varnames = forward_code.co_varnames
+                    if 'seed' in forward_varnames:
+                        return module(x, seed=seed)
+                    else:
+                        return module(x)
+                else:
+                    return module(x)
+        
+        def _forward_with_lengths(self, module, x, seed, lengths):
+            """Recursively forward with lengths parameter for GRU models."""
+            if isinstance(module, SynthNoiseLinear) or isinstance(module, SynthNoiseConv2d):
+                return module(x, seed=seed)
+            elif isinstance(module, nn.Sequential):
+                for m in module:
+                    x = self._forward_with_lengths(m, x, seed, lengths)
+                return x
+            elif isinstance(module, nn.ModuleList):
+                for m in module:
+                    x = self._forward_with_lengths(m, x, seed, lengths)
+                return x
+            else:
+                # For other modules (like GRUAGNews), try to forward with lengths if supported
+                if hasattr(module, 'forward'):
+                    forward_code = module.forward.__code__
+                    forward_varnames = forward_code.co_varnames
+                    if 'lengths' in forward_varnames:
+                        if 'seed' in forward_varnames:
+                            return module(x, lengths=lengths, seed=seed)
+                        else:
+                            return module(x, lengths=lengths)
+                    elif 'seed' in forward_varnames:
+                        return module(x, seed=seed)
+                    else:
+                        return module(x)
+                else:
+                    return module(x)
+    
+    wrapped_model = SynthNoiseModel(model, config)
     return wrapped_model
 
