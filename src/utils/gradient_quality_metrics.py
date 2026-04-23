@@ -791,7 +791,9 @@ def sign_coupled_scaling_P(
             if o is None:
                 return
             d = o.shape[-1]
-            v = vec_cache.get((d,))
+            sv = seed if seed is not None else getattr(config, "seed", None)
+            sv_key = sv if sv is not None else 0
+            v = vec_cache.get((d, sv_key))
             if v is None:
                 return
             v = v.to(device=o.device, dtype=o.dtype)

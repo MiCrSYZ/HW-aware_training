@@ -1,0 +1,80 @@
+# GRU (AG News) — deterministic_clip ablations
+
+experiment_name: gru_agnews_deterministic_clip_suite
+seed: 42
+device: cuda
+
+dataset: agnews
+data_root: ./datasets/agnews
+num_classes: 4
+val_split: 0.1
+
+model_name: gru_agnews
+
+embed_dim: 128
+hidden_dim: 256
+num_layers: 2
+
+batch_size: 128
+epochs: 5
+num_workers: 8
+eval_interval: 1
+save_interval: 10
+
+use_torch_compile: false
+mixed_precision: false
+
+optimizer:
+  type: adam
+  lr: 0.001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+scheduler:
+  type: cosine
+  warmup_epochs: 5
+
+synth_noise:
+  noise_type: deterministic_clip
+  clip_c: 1.0
+  clip_c_eval: null
+  clip_dither: false
+
+experiment:
+  mode: synth_with_comp
+  noise_resample_mode: null
+  noise_sampling_interval: 1
+  template_mixed_training: false
+  template_mix_prob: 0.5
+  eval_noise_seed: null
+
+logging:
+  use_wandb: false
+  project_name: synth-noise-nn
+  run_name: gru_agnews_deterministic_clip_suite
+
+suite:
+  - name: A1_same_c_train_and_eval
+    group: A
+    overrides:
+      synth_noise:
+        clip_c: 1.0
+        clip_c_eval: null
+        clip_dither: false
+
+  - name: A2_train_c_nearby_c_eval
+    group: A
+    overrides:
+      synth_noise:
+        clip_c: 1.0
+        clip_c_eval: 0.9
+        clip_dither: false
+
+  - name: A3_clip_dither_control
+    group: A
+    overrides:
+      synth_noise:
+        clip_c: 1.0
+        clip_c_eval: null
+        clip_dither: true

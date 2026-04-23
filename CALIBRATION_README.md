@@ -38,7 +38,7 @@
 
 ```bash
 python -m src.experiments.calibrate_noise_strength \
-    --config configs/resnet20_memristor_comp.yaml \
+    --config configs/memristor/resnet20_memristor_comp.yaml \
     --target_delta 0.1 \
     --noise_type variability_sigma \
     --output calibration_results.json
@@ -87,7 +87,7 @@ python -m src.experiments.calibrate_noise_strength \
 
 ```json
 {
-  "config_path": "configs/resnet20_memristor_comp.yaml",
+  "config_path": "configs/memristor/resnet20_memristor_comp.yaml",
   "checkpoint_path": "checkpoints/model.pth",
   "noise_type": "variability_sigma",
   "target_delta": 0.1,
@@ -121,7 +121,7 @@ python -m src.experiments.calibrate_noise_strength \
 
 ```bash
 python -m src.experiments.calibrate_noise_strength \
-    --config configs/resnet20_memristor_comp.yaml \
+    --config configs/memristor/resnet20_memristor_comp.yaml \
     --checkpoint checkpoints/resnet20_baseline.pth \
     --target_delta 0.1 \
     --noise_type variability_sigma \
@@ -132,7 +132,7 @@ python -m src.experiments.calibrate_noise_strength \
 
 ```bash
 python -m src.experiments.calibrate_noise_strength \
-    --config configs/vit_tiny_memristor_comp.yaml \
+    --config configs/memristor/vit_tiny_memristor_comp.yaml \
     --checkpoint checkpoints/vit_tiny_baseline.pth \
     --target_delta 0.15 \
     --noise_type cond1_alpha \
@@ -145,7 +145,7 @@ python -m src.experiments.calibrate_noise_strength \
 
 ```bash
 python -m src.experiments.calibrate_noise_strength \
-    --config configs/resnet20_memristor_comp.yaml \
+    --config configs/memristor/resnet20_memristor_comp.yaml \
     --checkpoint checkpoints/resnet20_baseline.pth \
     --target_delta 0.2 \
     --noise_type adc_bits \

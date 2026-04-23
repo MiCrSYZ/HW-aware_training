@@ -1,0 +1,123 @@
+# ViT-Tiny — sign_coupled_scaling ablations (A/C suite)
+
+experiment_name: vit_tiny_sign_coupled_scaling_suite
+seed: 42
+device: cuda
+
+dataset: cifar10
+data_root: ./datasets/cifar-10
+num_classes: 10
+val_split: 0.1
+
+model_name: vit_tiny
+
+patch_size: 4
+embed_dim: 192
+depth: 6
+num_heads: 3
+mlp_ratio: 4.0
+qkv_bias: false
+
+batch_size: 256
+epochs: 100
+num_workers: 8
+eval_interval: 1
+save_interval: 10
+
+optimizer:
+  type: adamw
+  lr: 0.0009
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+scheduler:
+  type: cosine
+  warmup_epochs: 5
+
+mixed_precision: false
+
+synth_noise:
+  noise_type: sign_coupled_scaling
+  sign_scale_alpha: 1.0
+  sign_scale_v_resample: false
+  eval_seed: null
+
+  noise_injection:
+    patch_embed:
+      enable_noise: true
+    attn:
+      enable_noise_qkv: true
+      enable_noise_w_o: true
+      enable_noise_w_v: true
+    mlp:
+      enable_noise: true
+    head: false
+
+experiment:
+  mode: synth_with_comp
+  noise_resample_mode: null
+  noise_sampling_interval: 1
+  template_mixed_training: false
+  template_mix_prob: 0.5
+  eval_noise_seed: null
+
+logging:
+  use_wandb: false
+  project_name: synth-noise-nn
+  run_name: vit_tiny_sign_coupled_scaling_suite
+
+suite:
+  - name: A1_fixed_v_same_test
+    group: A
+    overrides:
+      synth_noise:
+        sign_scale_v_resample: false
+        eval_seed: null
+      experiment:
+        noise_resample_mode: null
+        eval_noise_seed: null
+
+  - name: A2_fixed_v_train_new_v_test
+    group: A
+    overrides:
+      synth_noise:
+        sign_scale_v_resample: false
+        eval_seed: 1
+      experiment:
+        noise_resample_mode: null
+        eval_noise_seed: 1
+
+  - name: A3_resampled_v_step_fresh_test
+    group: A
+    overrides:
+      synth_noise:
+        sign_scale_v_resample: true
+        eval_seed: null
+      experiment:
+        noise_resample_mode: step
+        eval_noise_seed: null
+
+  - name: C1_frozen_v
+    group: C
+    overrides:
+      synth_noise:
+        sign_scale_v_resample: false
+      experiment:
+        noise_resample_mode: null
+
+  - name: C2_epoch_wise_resampled_v
+    group: C
+    overrides:
+      synth_noise:
+        sign_scale_v_resample: true
+      experiment:
+        noise_resample_mode: epoch
+
+  - name: C3_step_wise_resampled_v
+    group: C
+    overrides:
+      synth_noise:
+        sign_scale_v_resample: true
+      experiment:
+        noise_resample_mode: step

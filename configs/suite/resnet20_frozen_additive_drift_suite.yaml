@@ -1,0 +1,166 @@
+# ResNet-20 — frozen_additive_drift ablations (A/B/C suite)
+
+experiment_name: resnet20_frozen_additive_drift_suite
+seed: 42
+device: cuda
+
+dataset: cifar10
+data_root: ./datasets/cifar-10
+num_classes: 10
+val_split: 0.1
+
+model_name: resnet20
+
+batch_size: 128
+epochs: 100
+num_workers: 8
+eval_interval: 1
+save_interval: 10
+
+optimizer:
+  type: sgd
+  lr: 0.1
+  momentum: 0.9
+  weight_decay: 1e-4
+
+scheduler:
+  type: cosine
+
+# Only additive drift (no other synth noise types used in this suite)
+synth_noise:
+  noise_type: frozen_additive_drift
+  drift_beta: 0.481653  # 0.481653, 0.368687
+  drift_use_norm: true
+  drift_frozen: true
+  drift_d_mean: 0.0
+
+  # Optional: fixed-but-different template at eval time (A2 uses it)
+  eval_seed: null
+
+  # Keep injection locations identical to existing synth configs
+  noise_injection:
+    stem: true
+    layer1: true
+    layer2: true
+    layer3: true
+    head: false
+
+experiment:
+  mode: synth_with_comp
+  # Noise resampling control during training:
+  # - noise_resample_mode: null | step | epoch
+  # - noise_sampling_interval: kept for backward compatibility (interval-based)
+  noise_resample_mode: null
+  noise_sampling_interval: 1
+  template_mixed_training: true
+  template_mix_prob: 0.68
+  eval_noise_seed: null
+
+logging:
+  use_wandb: false
+  project_name: synth-noise-nn
+  run_name: resnet20_frozen_additive_drift_suite
+
+# Optional: run only these groups (A, B, C). Omit or leave null to run all.
+# suite_groups: [A, B, C]
+
+suite:
+  # =========================
+  # Group A: 固定模板可记忆性
+  # =========================
+  - name: A1_frozen_same
+    group: A
+    overrides:
+      synth_noise:
+        drift_frozen: true
+        eval_seed: null
+      experiment:
+        noise_resample_mode: null
+        eval_noise_seed: null
+
+  - name: A2_frozen_train_new_test
+    group: A
+    overrides:
+      synth_noise:
+        drift_frozen: true
+        eval_seed: 1
+      experiment:
+        noise_resample_mode: null
+        eval_noise_seed: 1
+
+  # A3: 训练与 A1 相同（冻结 d）；验证/测试时每个前向重采样 d（train/eval 由 model.training 区分）
+  - name: A3_resampled_same_family_step
+    group: A
+    overrides:
+      synth_noise:
+        drift_frozen: true
+        drift_resample_when_eval: true
+        drift_d_mean: 0.0
+        eval_seed: null
+      experiment:
+        noise_resample_mode: null
+        eval_noise_seed: null
+
+  # =================================
+  # Group B: 均值偏置 vs 身份固定
+  # =================================
+  - name: B1_fixed_nonzero_mean
+    group: B
+    overrides:
+      synth_noise:
+        drift_frozen: true
+        drift_d_mean: 0.2
+        eval_seed: null
+      experiment:
+        noise_resample_mode: null
+        eval_noise_seed: null
+
+  - name: B2_resampled_nonzero_mean_step
+    group: B
+    overrides:
+      synth_noise:
+        drift_frozen: false
+        drift_d_mean: 0.2
+        eval_seed: null
+      experiment:
+        noise_resample_mode: step
+        eval_noise_seed: null
+
+  - name: B3_resampled_zero_mean_step
+    group: B
+    overrides:
+      synth_noise:
+        drift_frozen: false
+        drift_d_mean: 0.0
+        eval_seed: null
+      experiment:
+        noise_resample_mode: step
+        eval_noise_seed: null
+
+  # =========================
+  # Group C: 频率（刷新频率）
+  # =========================
+  - name: C1_frozen
+    group: C
+    overrides:
+      synth_noise:
+        drift_frozen: true
+      experiment:
+        noise_resample_mode: null
+
+  - name: C2_epoch_wise_resampled
+    group: C
+    overrides:
+      synth_noise:
+        drift_frozen: false
+      experiment:
+        noise_resample_mode: epoch
+
+  - name: C3_step_wise_resampled
+    group: C
+    overrides:
+      synth_noise:
+        drift_frozen: false
+      experiment:
+        noise_resample_mode: step
+

@@ -1,0 +1,126 @@
+# ViT-Tiny with synthetic noise and compensation (HAT)
+
+experiment_name: vit_tiny_synth_comp
+seed: 42
+device: cuda
+
+dataset: cifar10
+data_root: ./datasets/cifar-10
+num_classes: 10
+val_split: 0.1
+
+model_name: vit_tiny
+
+# ViT model architecture parameters
+patch_size: 4  # Patch size for image splitting (32x32 -> 8x8 patches with patch_size=4)
+embed_dim: 192  # Embedding dimension
+depth: 6  # Number of transformer blocks
+num_heads: 3  # Number of attention heads
+mlp_ratio: 4.0  # MLP hidden dimension ratio (hidden_dim = embed_dim * mlp_ratio)
+qkv_bias: false  # Whether to use bias in QKV projection
+
+batch_size: 256
+epochs: 100
+num_workers: 8
+eval_interval: 1
+save_interval: 10
+
+# ViT typically uses AdamW optimizer (decoupled weight decay, better for transformers)
+optimizer:
+  type: adamw  # AdamW with decoupled weight decay (recommended for ViT)
+  lr: 0.0009
+  weight_decay: 0.01  # AdamW handles weight decay better, can use higher value
+  betas: [0.9, 0.999]  # Adam betas (default)
+  eps: 1e-8  # Adam epsilon (default)
+
+scheduler:
+  type: cosine
+  warmup_epochs: 5  # Number of warmup epochs (linear warmup from 1% to 100% of base LR)
+
+# Mixed precision training (optional)
+# Options: false (FP32), 'fp16' (float16), 'bf16' (bfloat16, preferred for Ampere+ GPUs)
+# Note: For small models like ViT-Tiny, mixed precision may actually slow down training
+# due to overhead from type conversions and autocast context switching.
+# Mixed precision is more beneficial for large models (>100M parameters) and large batch sizes.
+mixed_precision: false  # Disabled for ViT-Tiny (small model, overhead > benefit)
+
+synth_noise:
+  # 合成噪声类型（不走权重-电导映射）
+  # 权重域: 'none' | 'iid_multiplicative' | 'heavy_tail'
+  # 'heavy_tail_output' | 'decoupled_consistent' | 'decoupled_inconsistent' |
+  # 'input_dependent' | 'coupled_consistent' | 'coupled_inconsistent'
+  # 'gradient_degenerate' | 'adversarial_direction_bias' | 'sign_gradient_corruption' | 'saturation_collapse'
+  # 'frozen_additive_drift' | 'sign_coupled_scaling' | 'rank_collapse' | 'deterministic_clip'
+  noise_type: deterministic_clip
+  
+  # i.i.d. multiplicative distortion
+  variability_sigma: 0.970020  # delta=1: 0.970020, delta=0.5: 0.424270, delta=0.8: 0.661369
+  
+  # heavy-tail forward noise
+  heavy_tail_alpha: 0.083201  # delta=0.5: 0.083201, delta=0.8: 0.180135, delta=1: 0.247307, delta=1.5: 0.990613
+  heavy_tail_nu: 2.0
+  # 向后兼容：也支持旧名称
+  cond1_alpha: 0.083201
+  cond1_nu: 2.0
+  
+  # input-dependent scale bias 参数（当 noise_type='input_dependent' 时生效）
+  input_dependent_alpha: 0.525128  # delta=1: 0.525128, delta=0.5: 0.265909, delta=0.8: 0.465520, delta=1.5: 1.978906
+  cond2_alpha: 0.265909
+
+  decoupled_consistent_sigma: 0.770271  # delta=0.5: 0.355918, delta=0.8: 0.593737, delta=1: 0.770271
+  decoupled_inconsistent_sigma: 1.313994  # delta=0.5: 0.569691, delta=0.8: 0.933570, delta=1: 1.313994
+  coupled_consistent_alpha: 0.639714  # delta=0.5: 0.265896, delta=0.8: 0.465490, delta=1: 0.639714
+  coupled_inconsistent_alpha: 2.0  # delta=0.5: 0.265896, delta=0.8: 0.465490, delta=1: 0.639714, delta=0.2: 0.099221
+  
+  # gradient-degenerate perturbations 参数（当 noise_type='gradient_degenerate' 时生效）
+  adc_bits: 4
+  enable_adc: true
+  # adc_backward_mode: null | ste | stopgrad
+  #   - null: 使用 SynthNoiseConfig.compensation_in_backward（默认 true，相当于 STE）
+  #   - ste:   强制使用 STE（g 直接穿过量化）
+  #   - stopgrad: 强制阻断梯度（仅 forward 量化）
+
+  adv_direction_beta: 1.828211  #1.828211
+  adv_direction_frozen: true
+  adv_direction_random_sign: false
+
+  sign_corrupt_p: 0.3  # 0.334375
+  sign_corrupt_mode: flip
+  sign_corrupt_noise_sigma: 1.0
+  backward_corruption_at: logits  # null | per_layer（默认）| logits
+
+  saturation_gamma: 5.0
+  saturation_alpha: 1.0
+
+  drift_beta: 10  # delta=1: 0.574084, delta_resampled=1: 0.574084
+  drift_use_norm: true
+  drift_frozen: true
+  sign_scale_alpha: 1.0  # delta=1: 0.381550
+  rank_k: 98  # delta=1: 49, delta_resampled=1: 97
+  rank_fill_sigma: 0.0
+  rank_resample: false
+  clip_c: 0.01  # delta=1: 1.371528, delta_dither=1: 1.414386
+  clip_dither: false
+
+  # ViT 合成噪声注入位置（与 ResNet 一致：全 true = 全层注入）
+  noise_injection:
+    patch_embed:
+      enable_noise: true
+    attn:
+      enable_noise_qkv: true
+      enable_noise_w_o: true
+      enable_noise_w_v: true
+    mlp:
+      enable_noise: true
+    head: false
+
+experiment:
+  mode: synth_with_comp  # synth_no_comp: train clean, eval with noise | synth_with_comp: train with noise (HAT)
+  noise_sampling_interval: 1  # Sample noise every k steps (1 = every step, 2 = every 2 steps, etc.)
+  template_mixed_training: false
+  template_mix_prob: 0.5
+
+logging:
+  use_wandb: false
+  project_name: synth-noise-nn
+  run_name: vit_tiny_synth_comp

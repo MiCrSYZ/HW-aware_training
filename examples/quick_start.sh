@@ -11,7 +11,7 @@ OUTPUT_DIR="outputs"
 # Function to run baseline experiment
 run_baseline() {
     echo "Running baseline ResNet-20 experiment..."
-    python -m src train --config ${CONFIG_DIR}/resnet20_baseline.yaml
+    python -m src train --config ${CONFIG_DIR}/baseline/resnet20_baseline.yaml
     echo "Baseline experiment completed!"
     echo ""
 }
@@ -19,7 +19,7 @@ run_baseline() {
 # Function to run memristor no compensation experiment
 run_memristor_no_comp() {
     echo "Running memristor ResNet-20 experiment (no compensation)..."
-    python -m src train --config ${CONFIG_DIR}/resnet20_memristor_no_comp.yaml
+    python -m src train --config ${CONFIG_DIR}/memristor/resnet20_memristor_no_comp.yaml
     echo "Memristor no-comp experiment completed!"
     echo ""
 }
@@ -27,7 +27,7 @@ run_memristor_no_comp() {
 # Function to run memristor with compensation experiment
 run_memristor_comp() {
     echo "Running memristor ResNet-20 experiment (with HAT compensation)..."
-    python -m src train --config ${CONFIG_DIR}/resnet20_memristor_comp.yaml --compensation hat
+    python -m src train --config ${CONFIG_DIR}/memristor/resnet20_memristor_comp.yaml --compensation hat
     echo "Memristor compensation experiment completed!"
     echo ""
 }
@@ -41,7 +41,7 @@ evaluate_checkpoint() {
     fi
     
     echo "Evaluating checkpoint: $checkpoint_path"
-    python -m src eval --config ${CONFIG_DIR}/resnet20_baseline.yaml --checkpoint "$checkpoint_path"
+    python -m src eval --config ${CONFIG_DIR}/baseline/resnet20_baseline.yaml --checkpoint "$checkpoint_path"
     echo "Evaluation completed!"
     echo ""
 }

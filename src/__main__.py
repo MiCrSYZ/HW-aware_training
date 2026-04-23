@@ -2,8 +2,8 @@
 CLI entrypoint for the memristor neural network framework.
 
 This module provides the main CLI interface. Run with:
-    python -m src train --config configs/default.yaml
-    python -m src eval --config configs/default.yaml --checkpoint model.pth
+    python -m src train --config configs/baseline/default.yaml
+    python -m src eval --config configs/baseline/default.yaml --checkpoint model.pth
 """
 
 import sys

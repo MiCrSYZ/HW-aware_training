@@ -8,7 +8,7 @@ A production-quality PyTorch experiment framework for evaluating neural networks
 - **Three Experiment Modes**:
   - `baseline`: Standard float training and evaluation
   - `memristor_no_comp`: Weights mapped to memristor device model at evaluation time
-  - `memristor_with_comp`: Hardware-aware training (HAT) or learned mapping compensation
+  - `memristor_with_comp`: Hardware-aware training (HAT) compensation
 - **Reproducibility**: Deterministic seeds, checkpointing, and comprehensive logging
 - **Visualization**: TensorBoard integration and local PNG plots
 - **Energy Estimation**: Hook for NeuroSim/MNSIM integration (stub provided)
@@ -31,58 +31,59 @@ pip install -r requirements.txt
 
 ```bash
 # CIFAR-10 baseline
-python -m src train --config configs/resnet20_baseline.yaml
+python -m src train --config configs/baseline/resnet20_baseline.yaml
 
 # MNIST baseline
-python -m src train --config configs/resnet20_mnist_baseline.yaml
+python -m src train --config configs/baseline/resnet20_mnist_baseline.yaml
 ```
 
 ### Run Memristor Experiment (No Compensation)
 
 ```bash
-python -m src.train --config configs/resnet20_memristor_no_comp.yaml
+python -m src.train --config configs/memristor/resnet20_memristor_no_comp.yaml
 ```
 
 ### Run Memristor Experiment (With HAT Compensation)
 
 ```bash
 # ResNet-20 with compensation
-python -m src train --config configs/resnet20_memristor_comp.yaml --compensation hat
+python -m src train --config configs/memristor/resnet20_memristor_comp.yaml --compensation hat
 
 # ViT-Tiny with compensation
-python -m src train --config configs/vit_tiny_memristor_comp.yaml --compensation hat
+python -m src train --config configs/memristor/vit_tiny_memristor_comp.yaml --compensation hat
 ```
 
 ### Resume Training
 
 ```bash
-python -m src train --config configs/resnet20_baseline.yaml --resume outputs/exp_name/seed_42/model_best.pth
+python -m src train --config configs/baseline/resnet20_baseline.yaml --resume outputs/exp_name/seed_42/model_best.pth
 ```
 
 ### Evaluate Checkpoint
 
 ```bash
-python -m src.eval --config configs/resnet20_baseline.yaml --checkpoint outputs/exp_name/seed_42/model_final.pth
+python -m src.eval --config configs/baseline/resnet20_baseline.yaml --checkpoint outputs/exp_name/seed_42/model_final.pth
 ```
 
 ## Available Configurations
 
-The `configs/` directory contains preset configurations:
+YAML presets live under `configs/` in subfolders by role:
 
-**ResNet-20:**
-- `resnet20_baseline.yaml` - Baseline training on CIFAR-10
-- `resnet20_memristor_no_comp.yaml` - Memristor evaluation without compensation
-- `resnet20_memristor_comp.yaml` - Memristor with HAT compensation
-- `resnet20_mnist_baseline.yaml` - Baseline training on MNIST
+| Folder | Purpose |
+|--------|---------|
+| `configs/baseline/` | Float training/eval (no memristor forward); includes `default.yaml` (full option reference) |
+| `configs/memristor/` | Real device-model runs: `*_memristor_no_comp.yaml`, `*_memristor_comp.yaml` (HAT) |
+| `configs/synth/` | Synthetic distortion / matched-distortion style experiments |
+| `configs/suite/` | Multi-setting suites (e.g. rank collapse, frozen additive drift) |
 
-**ViT-Tiny:**
-- `vit_tiny_baseline.yaml` - Baseline training on CIFAR-10
-- `vit_tiny_memristor_no_comp.yaml` - Memristor evaluation without compensation
-- `vit_tiny_memristor_comp.yaml` - Memristor with HAT compensation
+**Examples (paths):**
+- `configs/baseline/resnet20_baseline.yaml`, `configs/baseline/resnet20_mnist_baseline.yaml`, `configs/baseline/vit_tiny_baseline.yaml`
+- `configs/memristor/resnet20_memristor_no_comp.yaml`, `configs/memristor/resnet20_memristor_comp.yaml`
+- `configs/memristor/vit_tiny_memristor_comp.yaml`
 
 ## Configuration
 
-Configuration files are YAML-based and located in `configs/`. Key sections:
+Configuration files are YAML-based and located under `configs/<subfolder>/`. Key sections:
 
 - **General**: `seed`, `device`, `dataset`, `data_root`, `model_name`, `batch_size`, `epochs` (default: 100)
 - **Optimizer**: `optimizer.type`, `optimizer.lr`, `optimizer.weight_decay`
@@ -91,7 +92,7 @@ Configuration files are YAML-based and located in `configs/`. Key sections:
 - **Experiment**: `experiment.mode`, `experiment.compensation_method`, `experiment.energy_estimation`
 - **Logging**: `logging.use_wandb`, `logging.project_name`, `logging.run_name`
 
-See `configs/default.yaml` for a complete example with all available options.
+See `configs/baseline/default.yaml` for a complete example with all available options.
 
 ## Project Structure
 
@@ -99,7 +100,7 @@ See `configs/default.yaml` for a complete example with all available options.
 .
 ├── README.md
 ├── requirements.txt
-├── configs/              # YAML configuration files
+├── configs/              # YAML presets: baseline/, memristor/, synth/, suite/
 ├── src/
 │   ├── __main__.py      # CLI entrypoint
 │   ├── train.py         # Training script
@@ -124,8 +125,8 @@ See `configs/default.yaml` for a complete example with all available options.
            return MyModel(**kwargs)
        ...
    ```
-3. Create config file in `configs/` referencing the model name
-4. Run: `python -m src.train --config configs/my_model.yaml`
+3. Create a config file under the appropriate `configs/baseline/`, `configs/memristor/`, etc., referencing the model name
+4. Run: `python -m src.train --config configs/baseline/my_model.yaml` (or place under the appropriate `configs/` subfolder)
 
 ## Integrating Real Energy Estimator
 
@@ -184,7 +185,7 @@ Build and run with Docker:
 
 ```bash
 docker build -t memristor-nn -f docker/Dockerfile .
-docker run --gpus all -v $(pwd)/outputs:/app/outputs memristor-nn python -m src.train --config configs/resnet20_baseline.yaml
+docker run --gpus all -v $(pwd)/outputs:/app/outputs memristor-nn python -m src.train --config configs/baseline/resnet20_baseline.yaml
 ```
 
 ## Runtime Notes

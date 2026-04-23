@@ -42,7 +42,7 @@ memristor:
 
 ```bash
 python -m src.experiments.exp_noise_boundary \
-    --config configs/resnet20_memristor_comp.yaml \
+    --config configs/memristor/resnet20_memristor_comp.yaml \
     --noise_type adc_bits \
     --noise_strengths 16 12 10 8 6 4 2 \
     --output_dir outputs/noise_boundary_adc \
@@ -74,7 +74,7 @@ python -m src.experiments.exp_noise_boundary \
 ```bash
 # 测试ADC位数从16到2（噪声逐渐增大），使用STE模式
 python -m src.experiments.exp_noise_boundary \
-    --config configs/resnet20_memristor_comp.yaml \
+    --config configs/memristor/resnet20_memristor_comp.yaml \
     --noise_type adc_bits \
     --noise_strengths 16 14 12 10 8 6 4 2 \
     --output_dir outputs/noise_boundary_adc_ste \
@@ -83,7 +83,7 @@ python -m src.experiments.exp_noise_boundary \
 # 测试ADC量化噪声，使用direct模式（观察梯度消失导致的训练崩溃）
 # 注意：需要在配置文件中设置 adc_training_mode: direct
 python -m src.experiments.exp_noise_boundary \
-    --config configs/resnet20_memristor_comp.yaml \
+    --config configs/memristor/resnet20_memristor_comp.yaml \
     --noise_type adc_bits \
     --noise_strengths 16 14 12 10 8 6 4 2 \
     --output_dir outputs/noise_boundary_adc_direct \
@@ -95,7 +95,7 @@ python -m src.experiments.exp_noise_boundary \
 ```bash
 # 测试IR-drop缩放因子从0.0到2.0（噪声逐渐增大）
 python -m src.experiments.exp_noise_boundary \
-    --config configs/resnet20_memristor_comp.yaml \
+    --config configs/memristor/resnet20_memristor_comp.yaml \
     --noise_type ir_drop_scaling \
     --noise_strengths 0.0 0.2 0.4 0.6 0.8 1.0 1.2 1.4 1.6 1.8 2.0 \
     --output_dir outputs/noise_boundary_ir_drop \
@@ -108,7 +108,7 @@ python -m src.experiments.exp_noise_boundary \
 
 ```bash
 python -m src.experiments.exp_training_dynamics \
-    --config configs/resnet20_memristor_comp.yaml \
+    --config configs/memristor/resnet20_memristor_comp.yaml \
     --output_dir outputs/training_dynamics_adc \
     --noise_name adc_8bits_during_training \
     --enable_adc_during_training \
@@ -143,7 +143,7 @@ python -m src.experiments.exp_training_dynamics \
 ```bash
 # 使用正常的HAT训练（只注入可学习噪声）
 python -m src.experiments.exp_training_dynamics \
-    --config configs/resnet20_memristor_comp.yaml \
+    --config configs/memristor/resnet20_memristor_comp.yaml \
     --output_dir outputs/training_dynamics_learnable \
     --noise_name learnable_variability \
     --save_checkpoints \
@@ -155,7 +155,7 @@ python -m src.experiments.exp_training_dynamics \
 ```bash
 # 在训练时注入ADC量化噪声，使用STE模式（保持梯度流）
 python -m src.experiments.exp_training_dynamics \
-    --config configs/resnet20_memristor_comp.yaml \
+    --config configs/memristor/resnet20_memristor_comp.yaml \
     --output_dir outputs/training_dynamics_adc_ste \
     --noise_name unlearnable_adc_8bits_ste \
     --enable_adc_during_training \
@@ -170,7 +170,7 @@ python -m src.experiments.exp_training_dynamics \
 # 在训练时注入ADC量化噪声，使用direct模式（梯度会消失，观察训练崩溃）
 # 注意：需要在配置文件中设置 adc_training_mode: direct
 python -m src.experiments.exp_training_dynamics \
-    --config configs/resnet20_memristor_comp.yaml \
+    --config configs/memristor/resnet20_memristor_comp.yaml \
     --output_dir outputs/training_dynamics_adc_direct \
     --noise_name unlearnable_adc_8bits_direct \
     --enable_adc_during_training \
@@ -184,7 +184,7 @@ python -m src.experiments.exp_training_dynamics \
 ```bash
 # 在训练时注入paper版IR-drop
 python -m src.experiments.exp_training_dynamics \
-    --config configs/resnet20_memristor_comp.yaml \
+    --config configs/memristor/resnet20_memristor_comp.yaml \
     --output_dir outputs/training_dynamics_ir_drop \
     --noise_name unlearnable_ir_drop_paper \
     --enable_ir_drop_paper_during_training \

@@ -29,6 +29,6 @@ RUN mkdir -p outputs
 ENV PYTHONPATH=/app:$PYTHONPATH
 
 # Default command
-CMD ["python", "-m", "src.train", "--config", "configs/resnet20_baseline.yaml"]
+CMD ["python", "-m", "src.train", "--config", "configs/baseline/resnet20_baseline.yaml"]
 
 

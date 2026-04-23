@@ -1,0 +1,81 @@
+# ResNet-20 — deterministic_clip ablations
+# A1: train & val/test use same clip width c
+# A2: train with c_train; val/test use nearby c_test (distribution shift)
+# A3: dithered clip (compensable control; same c_train, no eval override)
+
+experiment_name: resnet20_deterministic_clip_suite
+seed: 42
+device: cuda
+
+dataset: cifar10
+data_root: ./datasets/cifar-10
+num_classes: 10
+val_split: 0.1
+
+model_name: resnet20
+
+batch_size: 128
+epochs: 100
+num_workers: 8
+eval_interval: 1
+save_interval: 10
+
+optimizer:
+  type: sgd
+  lr: 0.1
+  momentum: 0.9
+  weight_decay: 1e-4
+
+scheduler:
+  type: cosine
+
+synth_noise:
+  noise_type: deterministic_clip
+  clip_c: 0.5
+  clip_c_eval: null
+  clip_dither: false
+
+  noise_injection:
+    stem: true
+    layer1: true
+    layer2: true
+    layer3: true
+    head: false
+
+experiment:
+  mode: synth_with_comp
+  noise_resample_mode: null
+  noise_sampling_interval: 1
+  template_mixed_training: false
+  template_mix_prob: 0.5
+  eval_noise_seed: null
+
+logging:
+  use_wandb: false
+  project_name: synth-noise-nn
+  run_name: resnet20_deterministic_clip_suite
+
+suite:
+  - name: A1_same_c_train_and_eval
+    group: A
+    overrides:
+      synth_noise:
+        clip_c: 0.5
+        clip_c_eval: null
+        clip_dither: false
+
+  - name: A2_train_c_nearby_c_eval
+    group: A
+    overrides:
+      synth_noise:
+        clip_c: 0.5
+        clip_c_eval: 0.55
+        clip_dither: false
+
+  - name: A3_clip_dither_control
+    group: A
+    overrides:
+      synth_noise:
+        clip_c: 0.5
+        clip_c_eval: null
+        clip_dither: true

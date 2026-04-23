@@ -360,13 +360,18 @@ def run_experiment_synth(
             drift_beta=_float('drift_beta', 0.3),
             drift_use_norm=_bool('drift_use_norm', False),
             drift_frozen=_bool('drift_frozen', True),
+            drift_resample_when_eval=_bool('drift_resample_when_eval', False),
             drift_d_mean=_float('drift_d_mean', 0.0),
             sign_scale_alpha=_float('sign_scale_alpha', 0.5),
+            sign_scale_v_resample=_bool('sign_scale_v_resample', False),
             rank_k=int(synth_config.get('rank_k', 4)),
             rank_fill_sigma=_float('rank_fill_sigma', 0.0),
             rank_resample=_bool('rank_resample', False),
+            rank_resample_when_eval=_bool('rank_resample_when_eval', False),
             clip_c=_float('clip_c', 1.0),
+            clip_c_eval=(float(synth_config['clip_c_eval']) if synth_config.get('clip_c_eval') is not None else None),
             clip_dither=_bool('clip_dither', False),
+            input_dependent_v_resample=_bool('input_dependent_v_resample', False),
             seed=config.get('seed'),
             compensation_in_backward=_bool('compensation_in_backward', True),
             backward_corruption_at=synth_config.get('backward_corruption_at'),
@@ -388,8 +393,8 @@ def run_experiment_synth(
             f"saturation_gamma={synth_noise_config.saturation_gamma}, saturation_alpha={synth_noise_config.saturation_alpha}, "
             f"drift_beta={synth_noise_config.drift_beta}, drift_use_norm={synth_noise_config.drift_use_norm}, "
             f"drift_frozen={synth_noise_config.drift_frozen}, drift_d_mean={getattr(synth_noise_config,'drift_d_mean',None)}, "
-            f"sign_scale_alpha={synth_noise_config.sign_scale_alpha}, rank_k={synth_noise_config.rank_k}, rank_fill_sigma={synth_noise_config.rank_fill_sigma}, rank_resample={synth_noise_config.rank_resample}, "
-            f"clip_c={synth_noise_config.clip_c}, clip_dither={synth_noise_config.clip_dither}"
+            f"sign_scale_alpha={synth_noise_config.sign_scale_alpha}, sign_scale_v_resample={getattr(synth_noise_config, 'sign_scale_v_resample', False)}, rank_k={synth_noise_config.rank_k}, rank_fill_sigma={synth_noise_config.rank_fill_sigma}, rank_resample={synth_noise_config.rank_resample}, "
+            f"clip_c={synth_noise_config.clip_c}, clip_c_eval={getattr(synth_noise_config, 'clip_c_eval', None)}, clip_dither={synth_noise_config.clip_dither}, input_dependent_v_resample={getattr(synth_noise_config, 'input_dependent_v_resample', False)}"
         )
         
         # Extract noise injection configuration if available
@@ -640,12 +645,14 @@ def run_experiment_synth(
             elif experiment_mode == 'synth_no_comp':
                 # For no_comp: use synth noise model for validation (apply noise)
                 val_metrics = _validate_synth(
-                    synth_noise_model, val_loader, criterion, device, amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed
+                    synth_noise_model, val_loader, criterion, device, amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed,
+                    synth_noise_config=synth_noise_config,
                 )
             else:  # synth_with_comp
                 # For with_comp: model is already synth noise-wrapped
                 val_metrics = _validate_synth(
-                    model, val_loader, criterion, device, amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed
+                    model, val_loader, criterion, device, amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed,
+                    synth_noise_config=synth_noise_config,
                 )
         else:
             val_metrics = {'acc1': 0.0, 'loss': 0.0}
@@ -671,6 +678,8 @@ def run_experiment_synth(
             metrics['grad_var'] = train_metrics.get('grad_var', 0.0)
         if 'update_std' in train_metrics:
             metrics['update_std'] = train_metrics.get('update_std', 0.0)
+        if 'template_resampled_ratio' in train_metrics:
+            metrics['template_resampled_ratio'] = train_metrics.get('template_resampled_ratio', 0.0)
         
         metrics['data_time_avg'] = train_metrics.get('data_time_avg', 0.0)
         metrics['train_step_time_avg'] = train_metrics.get('train_step_time_avg', 0.0)
@@ -817,6 +826,8 @@ def run_experiment_synth(
                 tb_writer.add_scalar('Train/GradVar', metrics['grad_var'], epoch)
             if 'update_std' in metrics:
                 tb_writer.add_scalar('Train/UpdateStd', metrics['update_std'], epoch)
+            if 'template_resampled_ratio' in metrics:
+                tb_writer.add_scalar('Train/TemplateResampledRatio', metrics['template_resampled_ratio'], epoch)
             if 'dead_zone_ratio_element_mean' in metrics and not (isinstance(metrics.get('dead_zone_ratio_element_mean'), float) and np.isnan(metrics['dead_zone_ratio_element_mean'])):
                 tb_writer.add_scalar('GradQuality/DeadZoneRatioElement', metrics['dead_zone_ratio_element_mean'], epoch)
                 tb_writer.add_scalar('GradQuality/DeadZoneRatioChannel', metrics['dead_zone_ratio_channel_mean'], epoch)
@@ -890,6 +901,8 @@ def run_experiment_synth(
             log_msg += f" | grad_var={metrics.get('grad_var', 0.0):.4e}"
         if 'update_std' in metrics:
             log_msg += f" | update_std={metrics['update_std']:.4e}"
+        if 'template_resampled_ratio' in metrics:
+            log_msg += f" | template_resampled_ratio={metrics['template_resampled_ratio']:.3f}"
         if metrics.get('backward_diag_sign_corrupt_calls', 0) > 0:
             log_msg += f" | sign_corrupt_calls={metrics['backward_diag_sign_corrupt_calls']:.0f} flip_ratio={metrics.get('backward_diag_sign_corrupt_flip_ratio', 0):.3f}"
         if metrics.get('backward_diag_adv_bias_calls', 0) > 0:
@@ -978,11 +991,13 @@ def run_experiment_synth(
                 pre_load_val_metrics = _validate_synth(
                     synth_noise_model, val_loader, criterion, device,
                     amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed,
+                    synth_noise_config=synth_noise_config,
                 )
             else:
                 pre_load_val_metrics = _validate_synth(
                     model, val_loader, criterion, device,
                     amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed,
+                    synth_noise_config=synth_noise_config,
                 )
             pre_load_val_acc = float(pre_load_val_metrics['acc1'])
 
@@ -1011,12 +1026,14 @@ def run_experiment_synth(
                     pre_load_val_noise_off = _validate_synth(
                         _diag_model, val_loader, criterion, device,
                         amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed,
+                        synth_noise_config=synth_noise_config,
                     )['acc1']
 
                     # 2) Fixed eval_seed
                     pre_load_val_seed_fixed = _validate_synth(
                         _diag_model, val_loader, criterion, device,
                         amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=fixed_seed,
+                        synth_noise_config=synth_noise_config,
                     )['acc1']
                 finally:
                     _set_noise_enable(True)
@@ -1141,11 +1158,13 @@ def run_experiment_synth(
                 post_load_val_metrics = _validate_synth(
                     synth_noise_model, val_loader, criterion, device,
                     amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed,
+                    synth_noise_config=synth_noise_config,
                 )
             else:
                 post_load_val_metrics = _validate_synth(
                     model, val_loader, criterion, device,
                     amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed,
+                    synth_noise_config=synth_noise_config,
                 )
             post_load_val_acc = float(post_load_val_metrics['acc1'])
             experiment_logger.info(
@@ -1177,11 +1196,13 @@ def run_experiment_synth(
                     post_load_val_noise_off = _validate_synth(
                         _diag_model_post, val_loader, criterion, device,
                         amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed,
+                        synth_noise_config=synth_noise_config,
                     )['acc1']
                     # 2) Fixed eval_seed
                     post_load_val_seed_fixed = _validate_synth(
                         _diag_model_post, val_loader, criterion, device,
                         amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=fixed_seed,
+                        synth_noise_config=synth_noise_config,
                     )['acc1']
                 finally:
                     _set_noise_enable(True)
@@ -1222,6 +1243,7 @@ def run_experiment_synth(
             test_metrics = _validate_synth(
                 synth_noise_model, test_loader, criterion, device,
                 amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed,
+                synth_noise_config=synth_noise_config,
             )
         else:  # synth_with_comp
             eval_seed = None
@@ -1232,6 +1254,7 @@ def run_experiment_synth(
             test_metrics = _validate_synth(
                 model, test_loader, criterion, device,
                 amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed,
+                synth_noise_config=synth_noise_config,
             )
         
         test_log_msg = (
@@ -1253,6 +1276,7 @@ def run_experiment_synth(
                 val_final_metrics = _validate_synth(
                     synth_noise_model, val_loader, criterion, device,
                     amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed,
+                    synth_noise_config=synth_noise_config,
                 )
             else:
                 eval_seed = None
@@ -1263,6 +1287,7 @@ def run_experiment_synth(
                 val_final_metrics = _validate_synth(
                     model, val_loader, criterion, device,
                     amp_dtype=amp_dtype, is_gru=is_gru, eval_seed=eval_seed,
+                    synth_noise_config=synth_noise_config,
                 )
             experiment_logger.info(
                 f"Final model on val set: {val_final_metrics['acc1']:.2f}%, on test set: {test_metrics['acc1']:.2f}% "
@@ -1457,6 +1482,11 @@ def _train_synth_hat(
     exp_cfg = config.get('experiment', {}) if config else {}
     noise_sampling_interval = exp_cfg.get('noise_sampling_interval', 1)
     resample_mode = exp_cfg.get('noise_resample_mode', None)  # None | 'step' | 'epoch'
+    template_mixed_training = bool(exp_cfg.get('template_mixed_training', False))
+    template_mix_prob = float(exp_cfg.get('template_mix_prob', 0.5))
+    template_mix_prob = max(0.0, min(1.0, template_mix_prob))
+    template_total_steps = 0
+    template_resampled_steps = 0
     
     t_prev_end = time.perf_counter()
     for batch_idx, batch in enumerate(train_loader):
@@ -1490,14 +1520,56 @@ def _train_synth_hat(
             seed = 1000000 + interval_id
         else:
             seed = None
+
+        use_frozen_template = True
+        if template_mixed_training:
+            # Mixed-template HAT:
+            # - with probability p: use frozen template (seed=None, cache/frozen behavior)
+            # - with probability 1-p: use deterministic per-step seed + temporary resample flags
+            #   to avoid memorizing one fixed template.
+            template_total_steps += 1
+            use_frozen_template = bool(np.random.rand() < template_mix_prob)
+            if use_frozen_template:
+                seed = None
+            else:
+                template_resampled_steps += 1
+                seed = 4000000 + global_step
         
+        template_attr_restore = {}
+        if template_mixed_training and synth_noise_config is not None and not use_frozen_template:
+            for attr, value in (
+                ('drift_frozen', False),
+                ('rank_resample', True),
+                ('input_dependent_v_resample', True),
+                ('sign_scale_v_resample', True),
+                ('adv_direction_frozen', False),
+            ):
+                if hasattr(synth_noise_config, attr):
+                    template_attr_restore[attr] = getattr(synth_noise_config, attr)
+                    setattr(synth_noise_config, attr, value)
+
         logits_wrap = (
             synth_noise_config is not None
             and getattr(synth_noise_config, "backward_corruption_at", None) == "logits"
             and getattr(synth_noise_config, "noise_type", "") in ("sign_gradient_corruption", "adversarial_direction_bias")
         )
-        if use_amp:
-            with torch.amp.autocast('cuda', dtype=amp_dtype):
+        try:
+            if use_amp:
+                with torch.amp.autocast('cuda', dtype=amp_dtype):
+                    try:
+                        if is_gru and lengths is not None:
+                            output = model(data, lengths=lengths, seed=seed)
+                        else:
+                            output = model(data, seed=seed)
+                    except TypeError:
+                        if is_gru and lengths is not None:
+                            output = model(data, lengths=lengths)
+                        else:
+                            output = model(data)
+                    if logits_wrap:
+                        output = apply_logits_backward_corruption(output, synth_noise_config, seed=seed)
+                    loss = criterion(output, target)
+            else:
                 try:
                     if is_gru and lengths is not None:
                         output = model(data, lengths=lengths, seed=seed)
@@ -1511,20 +1583,9 @@ def _train_synth_hat(
                 if logits_wrap:
                     output = apply_logits_backward_corruption(output, synth_noise_config, seed=seed)
                 loss = criterion(output, target)
-        else:
-            try:
-                if is_gru and lengths is not None:
-                    output = model(data, lengths=lengths, seed=seed)
-                else:
-                    output = model(data, seed=seed)
-            except TypeError:
-                if is_gru and lengths is not None:
-                    output = model(data, lengths=lengths)
-                else:
-                    output = model(data)
-            if logits_wrap:
-                output = apply_logits_backward_corruption(output, synth_noise_config, seed=seed)
-            loss = criterion(output, target)
+        finally:
+            for attr, old_value in template_attr_restore.items():
+                setattr(synth_noise_config, attr, old_value)
         
         if torch.isnan(loss) or torch.isinf(loss):
             logger.warning(f"NaN/Inf detected in loss at epoch {epoch}, batch {batch_idx}. Skipping batch.")
@@ -1592,6 +1653,8 @@ def _train_synth_hat(
         'data_time_avg': avg_data_time,
         'train_step_time_avg': avg_step_time,
     }
+    if template_mixed_training and template_total_steps > 0:
+        result['template_resampled_ratio'] = float(template_resampled_steps) / float(template_total_steps)
     if os.environ.get("SYNTH_NOISE_DIAGNOSTIC", "").strip() in ("1", "true", "yes") and synth_noise_config is not None:
         diag = get_and_reset_backward_diagnostic()
         if diag.get("sign_corrupt_calls", 0) > 0 or diag.get("adv_bias_calls", 0) > 0:
@@ -1652,24 +1715,45 @@ def _validate_synth(
     amp_dtype: Optional[torch.dtype] = None,
     is_gru: bool = False,
     eval_seed: Optional[int] = None,
+    synth_noise_config: Optional[Any] = None,
 ) -> Dict[str, float]:
     """Validation with synthetic noise applied."""
+    old_clip_c = None
+    if synth_noise_config is not None and getattr(synth_noise_config, "noise_type", "") == "deterministic_clip":
+        ce = getattr(synth_noise_config, "clip_c_eval", None)
+        if ce is not None:
+            old_clip_c = synth_noise_config.clip_c
+            synth_noise_config.clip_c = float(ce)
+
     model.eval()
     losses = AverageMeter('Loss', ':.4f')
     top1 = AverageMeter('Acc@1', ':6.2f')
     
     use_amp = amp_dtype is not None
     
-    with torch.no_grad():
-        for batch in val_loader:
-            data, target, lengths = _unpack_batch(batch, is_agnews=is_gru)
-            data, target = data.to(device), target.to(device)
-            if lengths is not None:
-                lengths = lengths.to(device)
-            
-            # Forward with noise
-            if use_amp:
-                with torch.amp.autocast('cuda', dtype=amp_dtype):
+    try:
+        with torch.no_grad():
+            for batch in val_loader:
+                data, target, lengths = _unpack_batch(batch, is_agnews=is_gru)
+                data, target = data.to(device), target.to(device)
+                if lengths is not None:
+                    lengths = lengths.to(device)
+
+                # Forward with noise
+                if use_amp:
+                    with torch.amp.autocast('cuda', dtype=amp_dtype):
+                        try:
+                            if is_gru and lengths is not None:
+                                output = model(data, lengths=lengths, seed=eval_seed)
+                            else:
+                                output = model(data, seed=eval_seed)
+                        except TypeError:
+                            if is_gru and lengths is not None:
+                                output = model(data, lengths=lengths)
+                            else:
+                                output = model(data)
+                        loss = criterion(output, target)
+                else:
                     try:
                         if is_gru and lengths is not None:
                             output = model(data, lengths=lengths, seed=eval_seed)
@@ -1681,24 +1765,15 @@ def _validate_synth(
                         else:
                             output = model(data)
                     loss = criterion(output, target)
-            else:
-                try:
-                    if is_gru and lengths is not None:
-                        output = model(data, lengths=lengths, seed=eval_seed)
-                    else:
-                        output = model(data, seed=eval_seed)
-                except TypeError:
-                    if is_gru and lengths is not None:
-                        output = model(data, lengths=lengths)
-                    else:
-                        output = model(data)
-                loss = criterion(output, target)
-            
-            acc1 = accuracy(output, target, topk=(1,))[0]
-            losses.update(loss.item(), data.size(0))
-            top1.update(acc1, data.size(0))
-    
-    return {'loss': losses.avg, 'acc1': top1.avg}
+
+                acc1 = accuracy(output, target, topk=(1,))[0]
+                losses.update(loss.item(), data.size(0))
+                top1.update(acc1, data.size(0))
+
+        return {'loss': losses.avg, 'acc1': top1.avg}
+    finally:
+        if old_clip_c is not None and synth_noise_config is not None:
+            synth_noise_config.clip_c = old_clip_c
 
 
 def _sync_weights_to_synth_model(base_model: nn.Module, synth_model: nn.Module) -> None:
@@ -1913,13 +1988,18 @@ def build_grad_model_and_loader_from_config(
         drift_beta=_f('drift_beta', 0.3),
         drift_use_norm=_b('drift_use_norm', False),
         drift_frozen=_b('drift_frozen', True),
+        drift_resample_when_eval=_b('drift_resample_when_eval', False),
         drift_d_mean=_f('drift_d_mean', 0.0),
         sign_scale_alpha=_f('sign_scale_alpha', 0.5),
+        sign_scale_v_resample=_b('sign_scale_v_resample', False),
         rank_k=int(synth_config.get('rank_k', 4)),
         rank_fill_sigma=_f('rank_fill_sigma', 0.0),
         rank_resample=_b('rank_resample', False),
+        rank_resample_when_eval=_b('rank_resample_when_eval', False),
         clip_c=_f('clip_c', 1.0),
+        clip_c_eval=(float(synth_config['clip_c_eval']) if synth_config.get('clip_c_eval') is not None else None),
         clip_dither=_b('clip_dither', False),
+        input_dependent_v_resample=_b('input_dependent_v_resample', False),
         seed=config.get('seed'),
         compensation_in_backward=_b('compensation_in_backward', True),
         backward_corruption_at=synth_config.get('backward_corruption_at'),

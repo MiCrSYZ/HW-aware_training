@@ -112,16 +112,22 @@ class SynthNoiseConfig:
         drift_beta: float = 0.3,
         drift_use_norm: bool = False,   # False=element-wise |z|, True=scalar ‖z‖
         drift_frozen: bool = True,      # False = control (zero-mean, compensable)
+        drift_resample_when_eval: bool = False,  # True: train like frozen; val/test resample d each call (A3)
         drift_d_mean: float = 0.0,      # mean bias added to d before normalization (ablation)
         # ── sign_coupled_scaling (new) ─────────────────────────────────────
         sign_scale_alpha: float = 0.5,
+        sign_scale_v_resample: bool = False,  # True = resample v each forward (control vs frozen v)
         # ── rank_collapse (new) ────────────────────────────────────────────
         rank_k: int = 4,
         rank_fill_sigma: float = 0.0,   # set by calibration to match δ target
         rank_resample: bool = False,    # True = resample P_k every call (per step/batch); False = fixed projector
+        rank_resample_when_eval: bool = False,  # True: train fixed P_k; val/test resample P_k (A3 rank suite)
         # ── deterministic_clip (new) ───────────────────────────────────────
         clip_c: float = 1.0,
+        clip_c_eval: Optional[float] = None,  # if set, val/test use this c (train keeps clip_c)
         clip_dither: bool = False,      # True = compensable control
+        # ── input_dependent / coupled_* (shared forward path) ─────────────
+        input_dependent_v_resample: bool = False,  # True = resample v each forward (coupled_inconsistent ablation)
         # ── shared ────────────────────────────────────────────────────────
         seed: Optional[int] = None,
         compensation_in_backward: bool = True,
@@ -150,13 +156,18 @@ class SynthNoiseConfig:
         self.drift_beta = drift_beta
         self.drift_use_norm = drift_use_norm
         self.drift_frozen = drift_frozen
+        self.drift_resample_when_eval = drift_resample_when_eval
         self.drift_d_mean = drift_d_mean
         self.sign_scale_alpha = sign_scale_alpha
+        self.sign_scale_v_resample = sign_scale_v_resample
         self.rank_k = rank_k
         self.rank_fill_sigma = rank_fill_sigma
         self.rank_resample = rank_resample
+        self.rank_resample_when_eval = rank_resample_when_eval
         self.clip_c = clip_c
+        self.clip_c_eval = clip_c_eval
         self.clip_dither = clip_dither
+        self.input_dependent_v_resample = input_dependent_v_resample
         self.seed = seed
         self.compensation_in_backward = compensation_in_backward
         self.backward_corruption_at = backward_corruption_at
@@ -283,7 +294,18 @@ def apply_input_dependent_scale_bias(out, config, seed=None, compensation_overri
     d     = out.shape[-1]
     key   = (d,)
     sv    = seed if seed is not None else config.seed
-    v     = _frozen_vec(config._input_dependent_v_vectors, key, d, out.device, out.dtype,
+    if getattr(config, "input_dependent_v_resample", False):
+        if seed is not None:
+            gen = torch.Generator(device=out.device)
+            gen.manual_seed((seed + hash(key) % 1_000_000 + 0xD0DD) % 2**31)
+            v = torch.randn(d, generator=gen, device=out.device, dtype=out.dtype)
+        else:
+            v = torch.randn(d, device=out.device, dtype=out.dtype)
+        v = (v / (v.norm() + 1e-8)).detach()
+    else:
+        sv_key = sv if sv is not None else 0
+        key = (d, sv_key)
+        v = _frozen_vec(config._input_dependent_v_vectors, key, d, out.device, out.dtype,
                         sv, hash(key) % 1_000_000)
     vTz   = (out * (v.unsqueeze(0) if out.dim() == 2 else v.view(1, -1))).sum(-1, keepdim=True)
     s_z   = 1.0 + alpha * torch.tanh(vTz)
@@ -484,7 +506,7 @@ def apply_saturation_collapse(out, config):
 # =============================================================================
 
 def apply_frozen_additive_drift(out: torch.Tensor, config: SynthNoiseConfig,
-                                seed: Optional[int] = None) -> torch.Tensor:
+                                seed: Optional[int] = None, training: bool = True) -> torch.Tensor:
     """
     z' = z + β · magnitude(z) · d
 
@@ -498,6 +520,8 @@ def apply_frozen_additive_drift(out: torch.Tensor, config: SynthNoiseConfig,
     drift_frozen=False (control):  d is re-sampled i.i.d. each call.
       E[drift term] = 0 over minibatches → compensable.
       Use this as the same-δ control to isolate the frozen-direction effect.
+
+    drift_resample_when_eval: if True, use frozen d during training but resample d each call when not training (eval).
     """
     beta = config.drift_beta
     if beta == 0.: return out
@@ -505,7 +529,10 @@ def apply_frozen_additive_drift(out: torch.Tensor, config: SynthNoiseConfig,
     d_dim = out.shape[-1]
     sv    = seed if seed is not None else config.seed
 
-    if config.drift_frozen:
+    eval_resample = bool(getattr(config, "drift_resample_when_eval", False)) and not training
+    effective_frozen = bool(config.drift_frozen) and not eval_resample
+
+    if effective_frozen:
         # Cache by (dim, seed) so A2 can use a different fixed template at eval.
         sv_key = sv if sv is not None else 0
         key = (d_dim, sv_key)
@@ -527,7 +554,7 @@ def apply_frozen_additive_drift(out: torch.Tensor, config: SynthNoiseConfig,
         d = (d / (d.norm() + 1e-8)).detach()
     
     # Mean-bias for frozen case too (done after _frozen_vec so cache stays "same family")
-    if config.drift_frozen and getattr(config, "drift_d_mean", 0.0) != 0.0:
+    if effective_frozen and getattr(config, "drift_d_mean", 0.0) != 0.0:
         d = d + float(config.drift_d_mean)
         d = (d / (d.norm() + 1e-8)).detach()
 
@@ -540,7 +567,7 @@ def apply_frozen_additive_drift(out: torch.Tensor, config: SynthNoiseConfig,
                 )
             except Exception:
                 pass
-    elif config.drift_frozen:
+    elif effective_frozen:
         # Frozen but zero drift_d_mean: still allow debug once per (dim, seed)
         if os.environ.get("SYNTH_DEBUG_DRIFT_D", "").strip() in ("1", "true", "yes") and (not existed_before):
             try:
@@ -589,9 +616,19 @@ def apply_sign_coupled_scaling(out: torch.Tensor, config: SynthNoiseConfig,
     if alpha == 0.: return out
 
     d   = out.shape[-1]
-    key = (d,)
     sv  = seed if seed is not None else config.seed
-    v   = _frozen_vec(config._sign_scale_v_vectors, key, d, out.device, out.dtype, sv, 0xCAFE)
+    if getattr(config, "sign_scale_v_resample", False):
+        if seed is not None:
+            gen = torch.Generator(device=out.device)
+            gen.manual_seed((seed + 0xCAFE) % 2**31)
+            v = torch.randn(d, generator=gen, device=out.device, dtype=out.dtype)
+        else:
+            v = torch.randn(d, device=out.device, dtype=out.dtype)
+        v = (v / (v.norm() + 1e-8)).detach()
+    else:
+        sv_key = sv if sv is not None else 0
+        v_key = (d, sv_key)
+        v = _frozen_vec(config._sign_scale_v_vectors, v_key, d, out.device, out.dtype, sv, 0xCAFE)
 
     vTz = (out * v.unsqueeze(0)).sum(-1, keepdim=True)          # [batch, 1]
     s_z = (1.0 + alpha * torch.sign(vTz))                      # no detach: backward flows through s_z (∂sign/∂z = 0 a.e.)
@@ -599,7 +636,7 @@ def apply_sign_coupled_scaling(out: torch.Tensor, config: SynthNoiseConfig,
 
 
 def apply_rank_collapse(out: torch.Tensor, config: SynthNoiseConfig,
-                        seed: Optional[int] = None) -> torch.Tensor:
+                        seed: Optional[int] = None, training: bool = True) -> torch.Tensor:
     """
     z' = P_k · z + ε_fill,   P_k rank-k orthogonal projection.
 
@@ -609,6 +646,8 @@ def apply_rank_collapse(out: torch.Tensor, config: SynthNoiseConfig,
     - rank_resample=True: P_k is resampled every forward call (per step/batch).
       Each step still uses a rank-k projection, but the subspace changes; gradient
       can flow in different directions over time → control for "fixed direction" effect.
+
+    rank_resample_when_eval: if True, use fixed P_k during training but resample P_k each call when not training.
 
     Jacobian ∂z'/∂z = P_k  (rank k < d, symmetric).
 
@@ -621,7 +660,11 @@ def apply_rank_collapse(out: torch.Tensor, config: SynthNoiseConfig,
     d = out.shape[-1]
     k = min(config.rank_k, d)
 
-    if config.rank_resample:
+    effective_resample = bool(config.rank_resample)
+    if bool(getattr(config, "rank_resample_when_eval", False)) and not training:
+        effective_resample = True
+
+    if effective_resample:
         # Resampled projector: new P_k every call.
         # When seed is None: do NOT fall back to config.seed — that would yield the same P_k
         # every call and make rank_resample identical to rank_resample=False. Use fresh
@@ -724,9 +767,9 @@ def synth_noise_linear_forward(
     elif nt == 'adversarial_direction_bias' and not at_logits: out = apply_adversarial_direction_bias(out, config, seed=seed)
     elif nt == 'sign_gradient_corruption' and not at_logits:   out = apply_sign_gradient_corruption(out, config, seed=seed)
     elif nt == 'saturation_collapse':        out = apply_saturation_collapse(out, config)
-    elif nt == 'frozen_additive_drift':      out = apply_frozen_additive_drift(out, config, seed=seed)
+    elif nt == 'frozen_additive_drift':      out = apply_frozen_additive_drift(out, config, seed=seed, training=training)
     elif nt == 'sign_coupled_scaling':       out = apply_sign_coupled_scaling(out, config, seed=seed)
-    elif nt == 'rank_collapse':              out = apply_rank_collapse(out, config, seed=seed)
+    elif nt == 'rank_collapse':              out = apply_rank_collapse(out, config, seed=seed, training=training)
     elif nt == 'deterministic_clip':         out = apply_deterministic_clip(out, config)
 
     return out

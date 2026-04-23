@@ -1,0 +1,108 @@
+# GRU AG News with synthetic noise (no compensation)
+
+experiment_name: gru_agnews_synth_no_comp
+seed: 42
+device: cuda
+
+dataset: agnews
+data_root: ./datasets/agnews
+num_classes: 4
+val_split: 0.1
+
+model_name: gru_agnews
+
+# GRU model architecture parameters
+embed_dim: 128  # Embedding dimension
+hidden_dim: 256  # Hidden dimension
+num_layers: 2  # Number of GRU layers
+
+batch_size: 128
+epochs: 5
+num_workers: 8
+eval_interval: 1
+save_interval: 10
+
+# Performance optimizations
+use_torch_compile: false
+
+# Optimizer
+optimizer:
+  type: adam
+  lr: 0.001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+scheduler:
+  type: cosine
+  warmup_epochs: 5
+
+# Mixed precision training
+mixed_precision: false
+
+synth_noise:
+  # 合成噪声类型（不走权重-电导映射）
+  # 权重域: 'none' | 'iid_multiplicative' | 'heavy_tail'
+  # 输出域可补偿: 'heavy_tail_output' | 'decoupled_consistent' | 'decoupled_inconsistent' |
+  #   'input_dependent' | 'coupled_consistent' | 'coupled_inconsistent'
+  # 输出域不可补偿: 'gradient_degenerate' | 'adversarial_direction_bias' | 'sign_gradient_corruption' |
+  #   'saturation_collapse' | 'frozen_additive_drift' | 'sign_coupled_scaling' | 'rank_collapse' | 'deterministic_clip'
+  noise_type: input_dependent  # Set to desired noise type
+  
+  # i.i.d. multiplicative distortion 参数（当 noise_type='iid_multiplicative' 时生效）
+  variability_sigma: 6.173798  # delta=0.5: 3.781250, delta=0.8: 6.173798, delta=1: 8.031816
+  
+  # heavy-tail forward noise 参数（当 noise_type='heavy_tail' 时生效）
+  heavy_tail_alpha: 2.427031  #delta=0.5: 1.552084, delta=0.8: 2.345937， delta=1: 2.427031
+  heavy_tail_nu: 2.0
+  # 向后兼容：也支持旧名称
+  cond1_alpha: 0.028492
+  cond1_nu: 2.0
+  
+  # input-dependent scale bias 参数（当 noise_type='input_dependent' 时生效）
+  input_dependent_alpha: 1.050091  #delta=0.5: 0.525046, delta=0.8: 0.840073, delta=1: 1.050091
+  cond2_alpha: 0.081807
+  decoupled_consistent_sigma: 0.05
+  decoupled_inconsistent_sigma: 0.05
+  coupled_consistent_alpha: 0.1
+  coupled_inconsistent_alpha: 0.1
+  
+  # gradient-degenerate perturbations 参数（当 noise_type='gradient_degenerate' 时生效）
+  adc_bits: 2  # ADC量化位数
+  enable_adc: true  # 启用ADC量化（gradient_degenerate模式需要）
+  # adc_backward_mode: null | ste | stopgrad
+  #   - null: 使用 SynthNoiseConfig.compensation_in_backward（默认 true，相当于 STE）
+  #   - ste:   强制使用 STE（g 直接穿过量化）
+  #   - stopgrad: 强制阻断梯度（仅 forward 量化）
+
+  # adversarial_direction_bias 参数
+  adv_direction_beta: 1.0
+  adv_direction_frozen: true
+  adv_direction_random_sign: false
+
+  # sign_gradient_corruption 参数
+  sign_corrupt_p: 0.5
+  sign_corrupt_mode: flip
+  sign_corrupt_noise_sigma: 1.0
+  saturation_gamma: 5.0
+  saturation_alpha: 1.0
+  drift_beta: 0.3
+  drift_use_norm: false
+  drift_frozen: true
+  sign_scale_alpha: 0.5
+  rank_k: 4
+  rank_fill_sigma: 0.0
+  rank_resample: false
+  clip_c: 1.0
+  clip_dither: false
+
+experiment:
+  mode: synth_no_comp  # synth_no_comp: train clean, eval with noise | synth_with_comp: train with noise (HAT)
+  noise_sampling_interval: 1
+  template_mixed_training: false
+  template_mix_prob: 0.5
+
+logging:
+  use_wandb: false
+  project_name: synth-noise-nn
+  run_name: gru_agnews_synth_no_comp

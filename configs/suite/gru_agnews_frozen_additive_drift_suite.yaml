@@ -1,0 +1,149 @@
+# GRU (AG News) — frozen_additive_drift ablations (A/B/C suite)
+
+experiment_name: gru_agnews_frozen_additive_drift_suite
+seed: 42
+device: cuda
+
+dataset: agnews
+data_root: ./datasets/agnews
+num_classes: 4
+val_split: 0.1
+
+model_name: gru_agnews
+
+embed_dim: 128
+hidden_dim: 256
+num_layers: 2
+
+batch_size: 128
+epochs: 5
+num_workers: 8
+eval_interval: 1
+save_interval: 10
+
+use_torch_compile: false
+mixed_precision: false
+
+optimizer:
+  type: adam
+  lr: 0.001
+  weight_decay: 0.0001
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+scheduler:
+  type: cosine
+  warmup_epochs: 5
+
+# Only additive drift (no other synth noise types used in this suite)
+synth_noise:
+  noise_type: frozen_additive_drift
+  drift_beta: 1.0
+  drift_use_norm: true
+  drift_frozen: true
+  drift_d_mean: 0.0
+  eval_seed: null
+
+experiment:
+  mode: synth_with_comp
+  noise_resample_mode: null
+  noise_sampling_interval: 1
+  template_mixed_training: true
+  template_mix_prob: 0.5
+  eval_noise_seed: null
+
+logging:
+  use_wandb: false
+  project_name: synth-noise-nn
+  run_name: gru_agnews_frozen_additive_drift_suite
+
+suite:
+  - name: A1_frozen_same
+    group: A
+    overrides:
+      synth_noise:
+        drift_frozen: true
+        eval_seed: null
+      experiment:
+        noise_resample_mode: null
+        eval_noise_seed: null
+
+  - name: A2_frozen_train_new_test
+    group: A
+    overrides:
+      synth_noise:
+        drift_frozen: true
+        eval_seed: 1
+      experiment:
+        noise_resample_mode: null
+        eval_noise_seed: 1
+
+  - name: A3_resampled_same_family_step
+    group: A
+    overrides:
+      synth_noise:
+        drift_frozen: true
+        drift_resample_when_eval: true
+        drift_d_mean: 0.0
+        eval_seed: null
+      experiment:
+        noise_resample_mode: null
+        eval_noise_seed: null
+
+  - name: B1_fixed_nonzero_mean
+    group: B
+    overrides:
+      synth_noise:
+        drift_frozen: true
+        drift_d_mean: 0.2
+        eval_seed: null
+      experiment:
+        noise_resample_mode: null
+        eval_noise_seed: null
+
+  - name: B2_resampled_nonzero_mean_step
+    group: B
+    overrides:
+      synth_noise:
+        drift_frozen: false
+        drift_d_mean: 0.2
+        eval_seed: null
+      experiment:
+        noise_resample_mode: step
+        eval_noise_seed: null
+
+  - name: B3_resampled_zero_mean_step
+    group: B
+    overrides:
+      synth_noise:
+        drift_frozen: false
+        drift_d_mean: 0.0
+        eval_seed: null
+      experiment:
+        noise_resample_mode: step
+        eval_noise_seed: null
+
+  - name: C1_frozen
+    group: C
+    overrides:
+      synth_noise:
+        drift_frozen: true
+      experiment:
+        noise_resample_mode: null
+
+  - name: C2_epoch_wise_resampled
+    group: C
+    overrides:
+      synth_noise:
+        drift_frozen: false
+      experiment:
+        noise_resample_mode: epoch
+
+  - name: C3_step_wise_resampled
+    group: C
+    overrides:
+      synth_noise:
+        drift_frozen: false
+      experiment:
+        noise_resample_mode: step
+

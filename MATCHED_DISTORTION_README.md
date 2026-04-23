@@ -39,7 +39,7 @@
 首先训练一个 baseline 模型：
 
 ```bash
-python -m src.experiments.run_experiment --config configs/resnet20_baseline.yaml
+python -m src.experiments.run_experiment --config configs/baseline/resnet20_baseline.yaml
 ```
 
 训练完成后，checkpoint 会保存在 `outputs/resnet20_baseline/seed_42/.../model_best.pth`
@@ -48,7 +48,7 @@ python -m src.experiments.run_experiment --config configs/resnet20_baseline.yaml
 
 ```bash
 python -m src.experiments.exp_matched_distortion \
-    --config configs/resnet20_baseline.yaml \
+    --config configs/baseline/resnet20_baseline.yaml \
     --checkpoint outputs/resnet20_baseline/seed_42/.../model_best.pth \
     --output_dir ./outputs/matched_distortion \
     --calibration_samples 512 \
@@ -73,7 +73,7 @@ python -m src.experiments.exp_matched_distortion \
 
 ```bash
 python -m src.experiments.exp_matched_distortion \
-    --config configs/resnet20_baseline.yaml \
+    --config configs/baseline/resnet20_baseline.yaml \
     --checkpoint outputs/resnet20_baseline/seed_42/.../model_best.pth \
     --output_dir ./outputs/matched_distortion \
     --skip_calibration \
