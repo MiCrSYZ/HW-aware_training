@@ -26,6 +26,11 @@ env/
 ENV/
 .venv
 
+# Project dirs (local docs, papers, one-off scripts — not tracked)
+docs/
+scripts/
+latex/
+
 # IDE
 .vscode/
 .idea/
@@ -62,4 +67,14 @@ wandb/
 htmlcov/
 .pytest_cache/
 
+# Type checker / linter caches
+.mypy_cache/
+.ruff_cache/
 
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Type stubs cache (pyright)
+.pyright/

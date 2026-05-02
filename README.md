@@ -73,8 +73,6 @@ YAML presets live under `configs/` in subfolders by role:
 |--------|---------|
 | `configs/baseline/` | Float training/eval (no memristor forward); includes `default.yaml` (full option reference) |
 | `configs/memristor/` | Real device-model runs: `*_memristor_no_comp.yaml`, `*_memristor_comp.yaml` (HAT) |
-| `configs/synth/` | Synthetic distortion / matched-distortion style experiments |
-| `configs/suite/` | Multi-setting suites (e.g. rank collapse, frozen additive drift) |
 
 **Examples (paths):**
 - `configs/baseline/resnet20_baseline.yaml`, `configs/baseline/resnet20_mnist_baseline.yaml`, `configs/baseline/vit_tiny_baseline.yaml`
@@ -100,7 +98,7 @@ See `configs/baseline/default.yaml` for a complete example with all available op
 .
 ├── README.md
 ├── requirements.txt
-├── configs/              # YAML presets: baseline/, memristor/, synth/, suite/
+├── configs/              # YAML presets: baseline/, memristor/
 ├── src/
 │   ├── __main__.py      # CLI entrypoint
 │   ├── train.py         # Training script

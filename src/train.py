@@ -23,12 +23,10 @@ if 'OMP_NUM_THREADS' not in os.environ:
 
 try:
     from .experiments.run_experiment import run_experiment
-    from .experiments.run_experiment_synth import run_experiment_synth
     from .experiments.visualize import plot_accuracy_curve
     from .utils.seeds import set_seed
 except ImportError:
     from src.experiments.run_experiment import run_experiment
-    from src.experiments.run_experiment_synth import run_experiment_synth
     from src.experiments.visualize import plot_accuracy_curve
     from src.utils.seeds import set_seed
 
@@ -71,7 +69,7 @@ def main(args=None):
                            help='Compensation method (overrides config)')
         parser.add_argument('--output-dir', type=str, default=None, help='Output directory (overrides config)')
         parser.add_argument('--suite-groups', type=str, default=None,
-                           help='Only run these suite groups (e.g. A or A,B or A,B,C). Groups: A (A1/A2/A3), B (B1/B2/B3), C (C1/C2/C3)')
+                           help='Only run these suite groups (e.g. A or A,B or T). Groups: A/B/C are noise ablations, T is template-training strategies')
         parser.add_argument('--suite-variants', type=str, default=None,
                            help='Only run these suite variant names (exact match), e.g. A2_frozen_train_new_test or A2_frozen_train_new_test,C2_epoch_wise_resampled')
         args = parser.parse_args()
@@ -188,9 +186,10 @@ def main(args=None):
             logger.info(f"[{i+1}/{len(suite)}] Running variant: {v_name}")
             experiment_mode = v_cfg.get('experiment', {}).get('mode', 'baseline')
             if experiment_mode in ('synth_no_comp', 'synth_with_comp'):
-                run_experiment_synth(v_cfg, v_out, resume=args.resume)
-            else:
-                run_experiment(v_cfg, v_out, resume=args.resume)
+                raise ValueError(
+                    f"Unsupported experiment mode on memristor branch: {experiment_mode}"
+                )
+            run_experiment(v_cfg, v_out, resume=args.resume)
         return
 
     # Single-run path
@@ -225,11 +224,11 @@ def main(args=None):
     experiment_mode = config.get('experiment', {}).get('mode', 'baseline')
     logger.info(f"Experiment mode: {experiment_mode}")
 
-    # Synth 配置（synth_no_comp / synth_with_comp）走 run_experiment_synth，不读 config['memristor']
     if experiment_mode in ('synth_no_comp', 'synth_with_comp'):
-        results = run_experiment_synth(config, output_dir, resume=args.resume)
-    else:
-        results = run_experiment(config, output_dir, resume=args.resume)
+        raise ValueError(
+            f"Unsupported experiment mode on memristor branch: {experiment_mode}"
+        )
+    results = run_experiment(config, output_dir, resume=args.resume)
     
     # Generate plots
     import pandas as pd
@@ -249,4 +248,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-

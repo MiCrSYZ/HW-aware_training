@@ -15,7 +15,6 @@ try:
     from ..memristor.memristor_wrappers import MemristorLinear, MemristorConv2d
     from ..memristor.memristor_gru import MemristorGRU
     from ..memristor.device_model import MemristorDeviceModel
-    from ..memristor.synth_noise_wrappers import SynthNoiseLinear, SynthNoiseConv2d, SynthNoiseConfig
 except ImportError:
     from src.models.resnet20 import ResNet20
     from src.models.vit_tiny import ViTTiny
@@ -23,7 +22,6 @@ except ImportError:
     from src.memristor.memristor_wrappers import MemristorLinear, MemristorConv2d
     from src.memristor.memristor_gru import MemristorGRU
     from src.memristor.device_model import MemristorDeviceModel
-    from src.memristor.synth_noise_wrappers import SynthNoiseLinear, SynthNoiseConv2d, SynthNoiseConfig
 
 
 def get_model(
@@ -408,136 +406,5 @@ def wrap_model_with_memristor(
     # 
     # print("=" * 60 + "\n")
     
-    return wrapped_model
-
-
-def wrap_model_with_synth_noise(
-    model: nn.Module,
-    config: SynthNoiseConfig,
-    noise_config: Optional[Dict[str, Any]] = None,
-) -> nn.Module:
-    """
-    Wrap a model's layers with synthetic noise-aware versions.
-    
-    This function recursively replaces nn.Linear and nn.Conv2d layers
-    with SynthNoiseLinear and SynthNoiseConv2d equivalents.
-    Unlike memristor wrapping, this does NOT use weight-to-conductance mapping.
-    
-    Args:
-        model: Base model to wrap
-        config: SynthNoiseConfig instance
-        noise_config: Optional noise injection configuration dict from config file.
-                     If None, all layers get noise (backward compatibility).
-                     ResNet: stem, layer1, layer2, layer3, head (each true/false or {enable_noise: bool}).
-                     ViT: patch_embed, attn, mlp with enable_noise / enable_* keys.
-        
-    Returns:
-        Model with synthetic noise-aware layers
-    """
-    def _replace_in_module(module, parent_name=''):
-        """
-        Recursively replace Linear and Conv2d layers with synth noise versions.
-        
-        Args:
-            module: Module to process (will be modified in-place)
-            parent_name: Full name of parent module (for building full layer names)
-        """
-        # Get all direct children (not recursive)
-        for name, child in list(module.named_children()):
-            # Build full name for this layer
-            full_name = f"{parent_name}.{name}" if parent_name else name
-            
-            if isinstance(child, nn.Linear):
-                # Determine if noise should be injected for this layer
-                enable_noise = _should_inject_noise_for_layer(full_name, 'linear', noise_config)
-                # Replace Linear layer
-                setattr(module, name, SynthNoiseLinear(child, config, enable_noise=enable_noise))
-            elif isinstance(child, nn.Conv2d):
-                # Determine if noise should be injected for this layer
-                enable_noise = _should_inject_noise_for_layer(full_name, 'conv2d', noise_config)
-                # Replace Conv2d layer
-                setattr(module, name, SynthNoiseConv2d(child, config, enable_noise=enable_noise))
-            else:
-                # Recursively process child modules (Sequential, ModuleList, BasicBlock, etc.)
-                _replace_in_module(child, full_name)
-    
-    # In-place replace: modify the given model
-    _replace_in_module(model, parent_name='')
-    
-    class SynthNoiseModel(nn.Module):
-        def __init__(self, base_model, config):
-            super().__init__()
-            self.config = config
-            self.base_model = base_model  # same reference (already in-place replaced above)
-        
-        def forward(self, x, seed=None, lengths=None):
-            """Forward pass with optional seed for reproducibility."""
-            # Inject runtime seed so SynthNoise layers still receive deterministic
-            # seed even when parent modules' forward() signatures do not accept seed.
-            prev_runtime_seed = getattr(self.config, "_runtime_seed", None)
-            self.config._runtime_seed = seed
-            try:
-                # For GRU models, pass lengths if available
-                if lengths is not None:
-                    return self._forward_with_lengths(self.base_model, x, seed, lengths)
-                else:
-                    return self._forward_with_seed(self.base_model, x, seed)
-            finally:
-                self.config._runtime_seed = prev_runtime_seed
-        
-        def _forward_with_seed(self, module, x, seed):
-            """Recursively forward with seed parameter where supported."""
-            if isinstance(module, SynthNoiseLinear) or isinstance(module, SynthNoiseConv2d):
-                return module(x, seed=seed)
-            elif isinstance(module, nn.Sequential):
-                for m in module:
-                    x = self._forward_with_seed(m, x, seed)
-                return x
-            elif isinstance(module, nn.ModuleList):
-                for m in module:
-                    x = self._forward_with_seed(m, x, seed)
-                return x
-            else:
-                # For other modules, try to forward with seed if supported
-                if hasattr(module, 'forward'):
-                    forward_code = module.forward.__code__
-                    forward_varnames = forward_code.co_varnames
-                    if 'seed' in forward_varnames:
-                        return module(x, seed=seed)
-                    else:
-                        return module(x)
-                else:
-                    return module(x)
-        
-        def _forward_with_lengths(self, module, x, seed, lengths):
-            """Recursively forward with lengths parameter for GRU models."""
-            if isinstance(module, SynthNoiseLinear) or isinstance(module, SynthNoiseConv2d):
-                return module(x, seed=seed)
-            elif isinstance(module, nn.Sequential):
-                for m in module:
-                    x = self._forward_with_lengths(m, x, seed, lengths)
-                return x
-            elif isinstance(module, nn.ModuleList):
-                for m in module:
-                    x = self._forward_with_lengths(m, x, seed, lengths)
-                return x
-            else:
-                # For other modules (like GRUAGNews), try to forward with lengths if supported
-                if hasattr(module, 'forward'):
-                    forward_code = module.forward.__code__
-                    forward_varnames = forward_code.co_varnames
-                    if 'lengths' in forward_varnames:
-                        if 'seed' in forward_varnames:
-                            return module(x, lengths=lengths, seed=seed)
-                        else:
-                            return module(x, lengths=lengths)
-                    elif 'seed' in forward_varnames:
-                        return module(x, seed=seed)
-                    else:
-                        return module(x)
-                else:
-                    return module(x)
-    
-    wrapped_model = SynthNoiseModel(model, config)
     return wrapped_model
 
