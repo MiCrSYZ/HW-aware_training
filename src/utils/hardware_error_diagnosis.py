@@ -140,7 +140,7 @@ def fit_static_deltaW(
         
         # Use torch.linalg.lstsq for each output dimension
         for j in range(out_dim):
-            # Solve: x_ref @ w_j ≈ eps_ref[:, j] （求最小二乘解）
+            # Solve least squares: x_ref @ w_j ≈ eps_ref[:, j]
             solution, _, _, _ = torch.linalg.lstsq(
                 x_ref, eps_ref[:, j:j+1]
             )

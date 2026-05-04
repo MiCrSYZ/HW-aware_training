@@ -31,6 +31,10 @@ docs/
 scripts/
 latex/
 
+# Local root-level notes; keep the public README tracked
+/*.md
+!/README.md
+
 # IDE
 .vscode/
 .idea/

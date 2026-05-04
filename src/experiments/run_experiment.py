@@ -113,61 +113,49 @@ def compute_boundary_regularization(
     beta: float = 0.8,
 ) -> torch.Tensor:
     """
-    计算远离边界的正则化损失。
-    
+    Boundary-avoidance regularization on memristor layer weights.
+
     L_boundary(W) = (1/N) * sum_i (max(|W_i| - β*w_max, 0))^2
-    
+
     Args:
-        model: 模型（可能是 MemristorModel wrapper，需要访问 base_model）
-        device_model: MemristorDeviceModel 实例，包含 wmax 信息
-        beta: 边界阈值比例，默认 0.8
-        
+        model: Network (may be a MemristorModel wrapper; uses base_model when present).
+        device_model: MemristorDeviceModel providing wmax.
+        beta: Threshold as a fraction of wmax (default 0.8).
+
     Returns:
-        正则化损失值（标量）
+        Scalar regularization tensor.
     """
-    # 获取实际的模型
     target_model = model
     if hasattr(model, 'base_model'):
         target_model = model.base_model
-    
-    # 获取 wmax（权重裁剪上界）
+
     wmax = device_model.wmax
-    
-    # 计算阈值
     threshold = beta * wmax
-    
+
     total_reg = None
     total_params = 0
-    
-    # 遍历所有 memristor 层
+
     for module in target_model.modules():
-        # 检查是否是 memristor 层（有权重参数）
         if hasattr(module, 'weight') and module.weight is not None:
-            # 检查是否是 memristor 相关的层
-            # MemristorLinear, MemristorConv2d, 以及 learned mapping 的层都有 weight
             module_name = type(module).__name__
             if 'Memristor' in module_name or hasattr(module, 'device_model'):
                 W = module.weight
                 N = W.numel()
-                
-                # 计算远离边界的正则化
-                # max(|W_i| - β*w_max, 0)^2
+
                 abs_W = torch.abs(W)
                 excess = torch.clamp(abs_W - threshold, min=0.0)
                 layer_reg = (excess ** 2).sum() / N
-                
+
                 if total_reg is None:
                     total_reg = layer_reg
                 else:
                     total_reg = total_reg + layer_reg
                 total_params += 1
-    
+
     if total_params > 0:
         return total_reg
-    else:
-        # 如果没有找到 memristor 层，返回零张量
-        device = next(model.parameters()).device if len(list(model.parameters())) > 0 else torch.device('cpu')
-        return torch.tensor(0.0, device=device, requires_grad=True)
+    device = next(model.parameters()).device if len(list(model.parameters())) > 0 else torch.device('cpu')
+    return torch.tensor(0.0, device=device, requires_grad=True)
 
 
 def run_experiment(
@@ -330,7 +318,7 @@ def run_experiment(
     if config['experiment']['mode'] != 'baseline':
         memristor_config = config['memristor']
         
-        # 读取参数
+        # Memristor config: array / ADC / energy
         array_size = memristor_config.get('array_size', 128)
         adc_bits = memristor_config.get('adc_bits', 8)
         enable_update_model = memristor_config.get('enable_update_model', False)
@@ -338,7 +326,7 @@ def run_experiment(
         adc_add_noise = memristor_config.get('adc_add_noise', False)
         enable_energy = memristor_config.get('enable_energy', False)
         
-        # 读取更新模型参数
+        # State-dependent write (update) model parameters
         update_params = memristor_config.get('update_params', None)
         if update_params is None:
             update_params = {
@@ -350,7 +338,7 @@ def run_experiment(
                 'write_noise_ratio': memristor_config.get('write_noise_ratio', 0.05),
             }
         else:
-            # 确保所有参数都存在
+            # Fill missing keys with defaults
             default_update = {
                 'A_plus': 1e-5, 'A_minus': 1e-5, 'p_plus': 1.0, 'p_minus': 1.0,
                 'gamma': 1.0, 'write_noise_ratio': 0.05
@@ -359,7 +347,7 @@ def run_experiment(
                 if key not in update_params:
                     update_params[key] = val
         
-        # 读取能耗系数
+        # Energy model coefficients
         energy_coefs = memristor_config.get('energy_coefs', None)
         if energy_coefs is None:
             energy_coefs = {
@@ -372,29 +360,28 @@ def run_experiment(
                 if key not in energy_coefs:
                     energy_coefs[key] = val
         
-        # 读取电导漂移时间设置方式
+        # Drift time mode ('fixed' vs 'accumulate', etc.)
         drift_time_mode = memristor_config.get('drift_time_mode', 'accumulate')
         drift_time_fixed = memristor_config.get('drift_time_fixed', 0)
         
-        # 读取IR-drop模型参数
+        # IR-drop model parameters
         ir_drop_mode = memristor_config.get('ir_drop_mode', 'none')
         ir_drop_gamma = memristor_config.get('ir_drop_gamma', 0.35)
         ir_drop_scaling = memristor_config.get('ir_drop_scaling', 1.0)
-        # crossbar模式参数
+        # Crossbar IR-drop extras
         ir_drop_eta = memristor_config.get('ir_drop_eta', 1.0)
         ir_drop_cap = memristor_config.get('ir_drop_cap', 0.10)
         ir_drop_norm = memristor_config.get('ir_drop_norm', 'mean')
-        ir_drop_train_enabled = memristor_config.get('ir_drop_train_enabled', True)  # 默认True保持向后兼容
-        
-        # 读取写入更新参数
+        ir_drop_train_enabled = memristor_config.get('ir_drop_train_enabled', True)  # default True for backward compatibility
+
+        # Multi-pulse writeback hyperparameters
         write_config = memristor_config.get('write', {})
-        write_t_min = float(write_config.get('t_min', 5e-9))  # 最小脉冲宽度
-        write_t_scale = float(write_config.get('t_scale', 50e-9))  # 脉冲时间的放大因子
-        write_V_write = float(write_config.get('V_write', 1.2))  # 写入电压
-        write_max_pulses = int(write_config.get('max_pulses', 200))  # 最大脉冲数
-        write_tolerance = float(write_config.get('tolerance', 0.02))  # 容差（相对于电导范围的比例）
-        # write_interval 默认等于 epochs（训练完成后一次性写入）
-        # 会在后面读取 epochs 后设置默认值
+        write_t_min = float(write_config.get('t_min', 5e-9))
+        write_t_scale = float(write_config.get('t_scale', 50e-9))
+        write_V_write = float(write_config.get('V_write', 1.2))
+        write_max_pulses = int(write_config.get('max_pulses', 200))
+        write_tolerance = float(write_config.get('tolerance', 0.02))
+        # write_interval defaults to epochs (single write after training); set after epochs is read
         
         device_model = MemristorDeviceModel(
             G_min=float(memristor_config['G_min']),
@@ -430,39 +417,35 @@ def run_experiment(
             enable_adc_during_training=bool(memristor_config.get('enable_adc_during_training', False)),
             adc_training_mode=str(memristor_config.get('adc_training_mode', 'ste')),  # Default to 'ste' for backward compatibility
             enable_ir_drop_paper_during_training=bool(memristor_config.get('enable_ir_drop_paper_during_training', False)),
-            # 合成噪声参数（从配置传入，否则合成噪声永远不会生效）
+            # Synthetic noise (must be passed from config or it stays disabled)
             synthetic_noise_type=str(memristor_config.get('synthetic_noise_type', 'none')),
             cond1_alpha=float(memristor_config.get('cond1_alpha', 0.1)),
             cond1_nu=float(memristor_config.get('cond1_nu', 2.0)),
             cond2_alpha=float(memristor_config.get('cond2_alpha', 0.1)),
         )
-        
-        # Log ADC training mode and synthetic noise for debugging
-        adc_mode_from_config = memristor_config.get('adc_training_mode', None)
-        print(f"[DEBUG CONFIG] adc_training_mode from config: {adc_mode_from_config}")
-        print(f"[DEBUG CONFIG] adc_training_mode in device_model: {device_model.adc_training_mode}")
+
         synthetic_type = getattr(device_model, 'synthetic_noise_type', 'none')
         if synthetic_type != 'none':
             experiment_logger.info(
                 f"Synthetic noise: type={synthetic_type}, cond1_alpha={device_model.cond1_alpha}, "
                 f"cond1_nu={device_model.cond1_nu}, cond2_alpha={device_model.cond2_alpha}"
             )
-            print(f"[DEBUG CONFIG] synthetic_noise_type={synthetic_type} (cond1_alpha={device_model.cond1_alpha}, cond2_alpha={device_model.cond2_alpha})")
         if device_model.enable_adc_during_training:
-            logger.info(f"ADC training enabled with mode: {device_model.adc_training_mode}")
-            print(f"[DEBUG] Device model ADC settings: enable_adc={device_model.enable_adc}, "
-                  f"enable_adc_during_training={device_model.enable_adc_during_training}, "
-                  f"adc_training_mode={device_model.adc_training_mode}")
-        
+            experiment_logger.info(
+                "ADC during training: enable_adc=%s enable_adc_during_training=%s adc_training_mode=%s",
+                device_model.enable_adc,
+                device_model.enable_adc_during_training,
+                device_model.adc_training_mode,
+            )
+
         # Create memristor-wrapped model for evaluation
         # Extract noise injection configuration if available
         noise_config = None
         if 'memristor' in config and 'noise_injection' in config['memristor']:
             noise_config = config['memristor']['noise_injection']
         
-        # wrap_model_with_memristor 会就地替换传入模型中的 Linear/Conv2d 为 Memristor 层。
-        # no_comp 要求训练用干净模型、评估用带噪模型，因此 no_comp 时必须包装 base 的深拷贝，
-        # 这样 base_model 保持 nn.Linear/nn.Conv2d，训练时无噪声；评估时用包装后的副本加噪声。
+        # wrap_model_with_memristor replaces Linear/Conv2d in-place with memristor layers.
+        # memristor_no_comp: train a clean copy, evaluate the noisy wrapped copy so base weights stay FP32 layers.
         if config['experiment']['mode'] == 'memristor_no_comp':
             base_for_noisy = copy.deepcopy(base_model)
             memristor_model = wrap_model_with_memristor(
@@ -485,7 +468,7 @@ def run_experiment(
             experiment_logger.info("memristor_no_comp mode: using base_model for training (no noise), memristor_model for eval/test (with noise)")
     else:  # baseline
         model = base_model
-        # baseline模式不需要写入参数，设置默认值
+        # Baseline: dummy write hyperparameters (writeback not used)
         write_t_min = 5e-9
         write_t_scale = 50e-9
         write_V_write = 1.2
@@ -554,13 +537,13 @@ def run_experiment(
     scheduler = None
     epochs = config.get('epochs', 100)  # Default to 100 epochs if not specified
     
-    # 读取写入间隔（如果未设置，默认为epochs，即训练完成后一次性写入）
+    # Writeback interval (default: once after all epochs)
     if config['experiment']['mode'] != 'baseline':
         write_config = config['memristor'].get('write', {})
         write_interval = write_config.get('write_interval', epochs)
         write_interval = int(write_interval)
     else:
-        write_interval = epochs  # baseline模式不需要写入
+        write_interval = epochs
     
     if 'scheduler' in config and config['scheduler']:
         scheduler_config = config['scheduler']
@@ -686,7 +669,7 @@ def run_experiment(
         epoch_start_time = time.time()
         #experiment_logger.info(f"Epoch {epoch}/{epochs-1} starting...")
         
-        # 重置能耗统计（如果启用，每个epoch开始时重置）
+        # Reset per-epoch energy counters when enabled
         if device_model and hasattr(device_model, 'enable_energy') and device_model.enable_energy:
             device_model.reset_energy_stats()
         
@@ -718,26 +701,21 @@ def run_experiment(
         else:
             raise ValueError(f"Unknown experiment mode: {experiment_mode}")
         
-        # 应用写入更新（根据 write_interval）
-        # memristor_no_comp 不执行 writeback：no_comp 仅“训练+推理时加噪声”，不模拟训练后写入硬件，
-        # 且 writeback 会覆盖权重导致准确率崩溃，且耗时极长（多脉冲仿真）。
-        # 如果 write_interval = epochs，则在训练循环结束后执行（避免重复）
-        # 否则，在训练循环中按间隔执行
-        if (experiment_mode != 'baseline' and 
+        # Periodic writeback (skipped for baseline and memristor_no_comp: would clobber trained weights and is slow)
+        if (experiment_mode != 'baseline' and
             experiment_mode != 'memristor_no_comp' and
-            device_model and 
-            device_model.enable_update_model and 
-            write_interval < epochs and  # 只在非一次性写入时在训练循环中执行
+            device_model and
+            device_model.enable_update_model and
+            write_interval < epochs and
             (epoch + 1) % write_interval == 0):
             experiment_logger.info(f"Applying writeback at epoch {epoch}")
             _apply_writeback(
-                model, device_model, 
+                model, device_model,
                 write_t_min, write_t_scale, write_V_write,
                 max_pulses=write_max_pulses,
                 tolerance=write_tolerance
             )
-            # memristor_no_comp 不在此分支内，无需同步
-        
+
         # Validate (with timing)
         eval_start_time = time.perf_counter()
         if val_loader is not None:
@@ -875,14 +853,12 @@ def run_experiment(
             minutes = int((epoch_time % 3600) // 60)
             epoch_time_str = f"{hours}h{minutes}m"
         
-        # 构建日志信息
         log_msg = (
             f"Epoch {epoch}/{epochs-1}: train_loss={metrics['train_loss']:.4f}, "
             f"train_acc={metrics['train_acc1']:.2f}%, "
             f"val_loss={metrics['val_loss']:.4f}, val_acc={metrics['val_acc1']:.2f}%"
         )
         
-        # 添加梯度统计信息和更新量统计（如果可用）
         if 'grad_norm' in metrics:
             log_msg += f" | grad_norm={metrics['grad_norm']:.4e}"
             if metrics.get('grad_norm_std', 0.0) > 0:
@@ -900,7 +876,6 @@ def run_experiment(
                 f" | eval_time={metrics.get('eval_time', 0):.2f}s"
             )
         
-        # 如果启用了能耗估计，添加能耗信息
         if device_model and hasattr(device_model, 'enable_energy') and device_model.enable_energy:
             energy_stats = device_model.get_energy_stats()
             if energy_stats:
@@ -909,7 +884,7 @@ def run_experiment(
                     f"read={energy_stats['read']:.6e}, "
                     f"total={energy_stats['write'] + energy_stats['read']:.6e}"
                 )
-        
+
         experiment_logger.info(log_msg)
         
         # Save best model checkpoint
@@ -931,22 +906,20 @@ def run_experiment(
         else:
             best_acc = max(best_acc, val_metrics['acc1'])
     
-    # 在训练循环结束后、最终测试前，如果 write_interval = epochs，执行最后一次 writeback
-    # memristor_no_comp 不执行：会覆盖权重导致准确率崩溃，且多脉冲仿真耗时极长
-    if (experiment_mode != 'baseline' and 
+    # Final writeback when interval equals full training (not used for memristor_no_comp)
+    if (experiment_mode != 'baseline' and
         experiment_mode != 'memristor_no_comp' and
-        device_model and 
-        device_model.enable_update_model and 
+        device_model and
+        device_model.enable_update_model and
         write_interval == epochs):
         experiment_logger.info("Applying final writeback before test evaluation")
         _apply_writeback(
-            model, device_model, 
+            model, device_model,
             write_t_min, write_t_scale, write_V_write,
             max_pulses=write_max_pulses,
             tolerance=write_tolerance
         )
-        # memristor_no_comp 不在此分支内，无需同步
-    
+
     # Final evaluation on test set
     if test_loader:
         if experiment_mode == 'baseline':
@@ -963,12 +936,10 @@ def run_experiment(
         else:  # memristor_with_comp
             # For with_comp: model is already memristor-wrapped
             test_metrics = _validate_memristor(model, test_loader, criterion, device, device_model, is_gru=is_gru)
-        # 构建测试日志信息
         test_log_msg = (
             f"Test accuracy: {test_metrics['acc1']:.2f}%, loss: {test_metrics['loss']:.4f}"
         )
-        
-        # 如果启用了能耗估计，添加能耗信息
+
         if 'energy_stats' in test_metrics and test_metrics['energy_stats']:
             energy_stats = test_metrics['energy_stats']
             test_log_msg += (
@@ -1133,112 +1104,7 @@ def _train_baseline(
             # Compute gradient variance (across all parameters)
             grad_var = all_grads.var().item()
             grad_vars.append(grad_var)
-            
-            # Print gradient statistics for each layer (only on first batch of first few epochs)
-            if batch_idx == 0 and epoch < 3:
-                print("=" * 80)
-                print(f"Gradient Statistics (Epoch {epoch}, Batch {batch_idx}) - Baseline:")
-                print("-" * 80)
-                
-                # Get base model if wrapped
-                base_model = model
-                if hasattr(model, 'base_model'):
-                    base_model = model.base_model
-                
-                layer_grad_stats = {}
-                for name, param in base_model.named_parameters():
-                    if param.grad is not None:
-                        grad_norm = param.grad.norm().item()
-                        grad_max = param.grad.abs().max().item()
-                        grad_mean = param.grad.mean().item()
-                        param_norm = param.data.norm().item()
-                        
-                        # Determine layer type
-                        layer_type = "unknown"
-                        if 'embedding' in name:
-                            layer_type = "embedding"
-                        elif 'gru' in name:
-                            if 'weight_ih' in name:
-                                layer_type = "gru_weight_ih"
-                            elif 'weight_hh' in name:
-                                layer_type = "gru_weight_hh"
-                            elif 'bias' in name:
-                                layer_type = "gru_bias"
-                            else:
-                                layer_type = "gru_other"
-                        elif 'head' in name:
-                            layer_type = "head"
-                        
-                        # Group by layer type
-                        if layer_type not in layer_grad_stats:
-                            layer_grad_stats[layer_type] = {
-                                'names': [],
-                                'grad_norms': [],
-                                'grad_maxs': [],
-                                'grad_means': [],
-                                'param_norms': [],
-                            }
-                        
-                        layer_grad_stats[layer_type]['names'].append(name)
-                        layer_grad_stats[layer_type]['grad_norms'].append(grad_norm)
-                        layer_grad_stats[layer_type]['grad_maxs'].append(grad_max)
-                        layer_grad_stats[layer_type]['grad_means'].append(grad_mean)
-                        layer_grad_stats[layer_type]['param_norms'].append(param_norm)
-                    else:
-                        # No gradient
-                        layer_type = "unknown"
-                        if 'embedding' in name:
-                            layer_type = "embedding"
-                        elif 'gru' in name:
-                            layer_type = "gru"
-                        elif 'head' in name:
-                            layer_type = "head"
-                        
-                        if layer_type not in layer_grad_stats:
-                            layer_grad_stats[layer_type] = {
-                                'names': [],
-                                'grad_norms': [],
-                                'grad_maxs': [],
-                                'grad_means': [],
-                                'param_norms': [],
-                            }
-                        layer_grad_stats[layer_type]['names'].append(name)
-                        layer_grad_stats[layer_type]['grad_norms'].append(0.0)
-                        layer_grad_stats[layer_type]['grad_maxs'].append(0.0)
-                        layer_grad_stats[layer_type]['grad_means'].append(0.0)
-                        layer_grad_stats[layer_type]['param_norms'].append(param.data.norm().item())
-                
-                # Print statistics by layer type
-                for layer_type in sorted(layer_grad_stats.keys()):
-                    stats = layer_grad_stats[layer_type]
-                    if not stats['names']:
-                        continue
-                    
-                    avg_grad_norm = np.mean(stats['grad_norms'])
-                    max_grad_norm = np.max(stats['grad_norms'])
-                    avg_grad_max = np.mean(stats['grad_maxs'])
-                    avg_grad_mean = np.mean(stats['grad_means'])
-                    zero_grad_count = sum(1 for n in stats['grad_norms'] if n < 1e-8)
-                    
-                    status = "✓" if avg_grad_norm > 1e-6 else "✗"
-                    print(f"{status} {layer_type:20s}: "
-                          f"avg_grad_norm={avg_grad_norm:.2e}, "
-                          f"max_grad_norm={max_grad_norm:.2e}, "
-                          f"avg_grad_max={avg_grad_max:.2e}, "
-                          f"zero_grad_layers={zero_grad_count}/{len(stats['names'])}")
-                    
-                    # Print individual layer details for GRU (to see which gates are blocked)
-                    if 'gru' in layer_type and epoch == 0:
-                        for name, grad_norm in zip(stats['names'], stats['grad_norms']):
-                            gate_info = ""
-                            if 'weight_ih' in name or 'weight_hh' in name:
-                                gate_info = " (gates: reset, update, candidate)"
-                            
-                            grad_status = "✓" if grad_norm > 1e-6 else "✗ BLOCKED"
-                            print(f"    {grad_status} {name}: grad_norm={grad_norm:.2e}{gate_info}")
-                
-                print("=" * 80)
-        
+
         # Optimizer step with gradient scaling
         if use_amp:
             scaler.step(optimizer)
@@ -1375,72 +1241,56 @@ def _program_conductance(
     tol: float = 0.02,
 ) -> Tuple[torch.Tensor, int]:
     """
-    多脉冲写入 → 验证循环。
-    
-    逐步将每个电导值推向目标值，使用迭代脉冲序列。
-    
+    Multi-pulse write / verify loop: iteratively nudge conductances toward targets.
+
     Args:
-        G_current: 当前电导值张量
-        G_target: 目标电导值张量
-        device_model: 忆阻器器件模型
-        write_V: 写入电压
-        write_t_min: 最小脉冲宽度
-        write_t_scale: 脉冲时间缩放因子
-        max_iters: 最大迭代次数
-        tol: 容差（相对于电导范围的比例）
-        
+        G_current: Starting conductance tensor.
+        G_target: Target conductance tensor.
+        device_model: Memristor device model (write_update, G range).
+        write_V: Write pulse voltage magnitude.
+        write_t_min: Minimum pulse width.
+        write_t_scale: Pulse width scaling vs normalized error.
+        max_iters: Maximum iterations (pulses).
+        tol: Relative tolerance as a fraction of conductance range.
+
     Returns:
-        G_final: 最终电导值张量
-        num_pulses: 实际使用的脉冲数（平均）
+        (G_final, num_iterations): programmed tensor and pulse count.
     """
     G_range = device_model.G_max - device_model.G_min
-    tolerance = tol * G_range  # 绝对容差
-    
+    tolerance = tol * G_range
+
     G_work = G_current.clone()
-    
-    # 计算初始误差
+
     error = G_target - G_work
     abs_error = torch.abs(error)
-    
-    # 使用掩码来跟踪哪些元素已经收敛
+
     converged_mask = abs_error < tolerance
-    
-    # 记录迭代次数（用于统计平均脉冲数）
+
     num_iterations = 0
-    
+
     for iter_step in range(max_iters):
-        # 如果所有元素都收敛，提前退出
         if converged_mask.all():
             break
-        
-        # 计算方向：sign(error)
+
         direction = torch.sign(error)
-        
-        # 计算归一化误差（用于动态脉冲宽度）
-        # 归一化到 [0.1, 1.0] 范围，确保小误差时也有足够的脉冲宽度
+
         error_norm = abs_error / (G_range + 1e-12)
         error_norm = torch.clamp(error_norm, min=0.1, max=1.0)
-        
-        # 计算动态脉冲宽度：write_t_min + write_t_scale * error_norm
-        # 误差大时使用更大的脉冲宽度，误差小时使用较小的脉冲宽度
+
         pulse_t = write_t_min + write_t_scale * error_norm
-        
-        # 脉冲电压：方向 * write_V
+
         pulse_V = direction * write_V
-        
-        # 应用写入更新（向量化操作，对所有元素同时进行）
+
         G_work = device_model.write_update(
             G_work, pulse_V, pulse_t, direction, seed=None
         )
-        
-        # 更新迭代计数
+
         num_iterations += 1
-        
-        # 重新计算误差和收敛掩码
+
         error = G_target - G_work
         abs_error = torch.abs(error)
         converged_mask = abs_error < tolerance
-    
+
     return G_work, num_iterations
 
 
@@ -1454,64 +1304,41 @@ def _apply_writeback(
     tolerance: float = 0.02,
 ) -> None:
     """
-    应用写入更新模型，将目标权重写入到忆阻器器件中。
-    
-    使用多脉冲写入-验证循环来模拟真实的忆阻器编程过程。
-    
-    对于每个有权重的模块：
-    1. 获取目标权重 W_target（optimizer更新后的权重）
-    2. 将当前权重映射到电导值 Gp_current, Gn_current（从硬件状态）
-    3. 将目标权重映射到目标电导值 Gp_target, Gn_target
-    4. 使用多脉冲循环将 (Gp_current, Gn_current) → (Gp_target, Gn_target)
-    5. 将编程后的电导值转换回权重并更新模块权重
-    
-    Args:
-        model: 模型（可能是 MemristorModel wrapper，需要访问 base_model）
-        device_model: 忆阻器器件模型
-        write_t_min: 最小脉冲宽度
-        write_t_scale: 脉冲时间的放大因子
-        write_V_write: 写入电压
-        max_pulses: 最大脉冲数（默认200）
-        tolerance: 容差（相对于电导范围的比例，默认0.02即2%）
+    Apply state-dependent write model: map target weights to conductances and program in hardware.
+
+    For each weight module: map current and target weights to G+/G-, run multi-pulse programming,
+    map back to weights and copy into ``module.weight``.
     """
     if not device_model.enable_update_model:
         return
-    
-    # 获取实际的模型
+
     target_model = model
     if hasattr(model, 'base_model'):
         target_model = model.base_model
-    
+
     with torch.no_grad():
         total_modules = 0
         total_pulses_p = 0.0
         total_pulses_n = 0.0
-        
+
         for module in target_model.modules():
-            # 只处理有权重的模块（Linear, Conv2d等）
             if not hasattr(module, 'weight') or module.weight is None:
                 continue
-            
+
             total_modules += 1
-            
-            # 获取目标权重（optimizer更新后的权重，这是我们要写入的目标）
+
             W_target = module.weight.data.clone()
-            
-            # 1. 将当前权重映射到当前电导值（从硬件状态）
-            # 这代表忆阻器上的实际电导值（上一轮写入后的状态）
-            Gp_current, Gn_current, max_abs_current = device_model.map_weights_to_conductance_diff_adaptive(
+
+            Gp_current, Gn_current, _ = device_model.map_weights_to_conductance_diff_adaptive(
                 module.weight.data
             )
-            
-            # 2. 将目标权重映射到目标电导值
+
             Gp_target, Gn_target, max_abs = device_model.map_weights_to_conductance_diff_adaptive(W_target)
-            
-            # 计算 scale（用于后续转换回权重）
+
             G_range = (device_model.G_max - device_model.G_min)
             scale = max_abs / (G_range + 1e-12)
             scale = torch.clamp(scale, min=1e-3, max=1e6)
-            
-            # 3. 使用多脉冲循环编程电导值
+
             Gp_prog, pulses_p = _program_conductance(
                 G_current=Gp_current,
                 G_target=Gp_target,
@@ -1536,19 +1363,15 @@ def _apply_writeback(
             
             total_pulses_p += pulses_p
             total_pulses_n += pulses_n
-            
-            # 4. 将编程后的电导值转换回权重
+
             W_new = (Gp_prog - Gn_prog) * scale
-            
-            # 检查是否有 NaN 或 Inf
+
             if torch.isnan(W_new).any() or torch.isinf(W_new).any():
                 logger.warning(f"W_new contains NaN/Inf in {type(module).__name__}, using target weights")
                 W_new = W_target.clone()
-            
-            # 更新模块权重
+
             module.weight.data.copy_(W_new)
-        
-        # 记录统计信息
+
         if total_modules > 0:
             avg_pulses_p = total_pulses_p / total_modules
             avg_pulses_n = total_pulses_n / total_modules
@@ -1752,114 +1575,7 @@ def _train_hat(
             if grad_norm < 1e-6 and batch_idx == 0:
                 logger.warning(f"Very small gradient norm detected: {grad_norm:.2e} at epoch {epoch}, batch {batch_idx}. "
                              f"This may indicate gradient vanishing (e.g., direct ADC mode).")
-            
-            # Print gradient statistics for each layer (only on first batch of first few epochs)
-            if batch_idx == 0 and epoch < 3:
-                print("=" * 80)
-                print(f"Gradient Statistics (Epoch {epoch}, Batch {batch_idx}):")
-                print("-" * 80)
-                
-                # Get base model if wrapped
-                base_model = model
-                if hasattr(model, 'base_model'):
-                    base_model = model.base_model
-                
-                layer_grad_stats = {}
-                for name, param in base_model.named_parameters():
-                    if param.grad is not None:
-                        grad_norm = param.grad.norm().item()
-                        grad_max = param.grad.abs().max().item()
-                        grad_mean = param.grad.mean().item()
-                        param_norm = param.data.norm().item()
-                        
-                        # Determine layer type
-                        layer_type = "unknown"
-                        if 'embedding' in name:
-                            layer_type = "embedding"
-                        elif 'gru' in name:
-                            if 'weight_ih' in name:
-                                layer_type = "gru_weight_ih"
-                            elif 'weight_hh' in name:
-                                layer_type = "gru_weight_hh"
-                            elif 'bias' in name:
-                                layer_type = "gru_bias"
-                            else:
-                                layer_type = "gru_other"
-                        elif 'head' in name:
-                            layer_type = "head"
-                        
-                        # Group by layer type
-                        if layer_type not in layer_grad_stats:
-                            layer_grad_stats[layer_type] = {
-                                'names': [],
-                                'grad_norms': [],
-                                'grad_maxs': [],
-                                'grad_means': [],
-                                'param_norms': [],
-                            }
-                        
-                        layer_grad_stats[layer_type]['names'].append(name)
-                        layer_grad_stats[layer_type]['grad_norms'].append(grad_norm)
-                        layer_grad_stats[layer_type]['grad_maxs'].append(grad_max)
-                        layer_grad_stats[layer_type]['grad_means'].append(grad_mean)
-                        layer_grad_stats[layer_type]['param_norms'].append(param_norm)
-                    else:
-                        # No gradient
-                        layer_type = "unknown"
-                        if 'embedding' in name:
-                            layer_type = "embedding"
-                        elif 'gru' in name:
-                            layer_type = "gru"
-                        elif 'head' in name:
-                            layer_type = "head"
-                        
-                        if layer_type not in layer_grad_stats:
-                            layer_grad_stats[layer_type] = {
-                                'names': [],
-                                'grad_norms': [],
-                                'grad_maxs': [],
-                                'grad_means': [],
-                                'param_norms': [],
-                            }
-                        layer_grad_stats[layer_type]['names'].append(name)
-                        layer_grad_stats[layer_type]['grad_norms'].append(0.0)
-                        layer_grad_stats[layer_type]['grad_maxs'].append(0.0)
-                        layer_grad_stats[layer_type]['grad_means'].append(0.0)
-                        layer_grad_stats[layer_type]['param_norms'].append(param.data.norm().item())
-                
-                # Print statistics by layer type
-                for layer_type in sorted(layer_grad_stats.keys()):
-                    stats = layer_grad_stats[layer_type]
-                    if not stats['names']:
-                        continue
-                    
-                    avg_grad_norm = np.mean(stats['grad_norms'])
-                    max_grad_norm = np.max(stats['grad_norms'])
-                    avg_grad_max = np.mean(stats['grad_maxs'])
-                    avg_grad_mean = np.mean(stats['grad_means'])
-                    zero_grad_count = sum(1 for n in stats['grad_norms'] if n < 1e-8)
-                    
-                    status = "✓" if avg_grad_norm > 1e-6 else "✗"
-                    print(f"{status} {layer_type:20s}: "
-                          f"avg_grad_norm={avg_grad_norm:.2e}, "
-                          f"max_grad_norm={max_grad_norm:.2e}, "
-                          f"avg_grad_max={avg_grad_max:.2e}, "
-                          f"zero_grad_layers={zero_grad_count}/{len(stats['names'])}")
-                    
-                    # Print individual layer details for GRU (to see which gates are blocked)
-                    if 'gru' in layer_type and epoch == 0:
-                        for name, grad_norm in zip(stats['names'], stats['grad_norms']):
-                            gate_info = ""
-                            if 'weight_ih' in name or 'weight_hh' in name:
-                                # GRU weights are organized as [reset, update, candidate] gates
-                                # Each gate is hidden_size rows
-                                gate_info = " (gates: reset, update, candidate)"
-                            
-                            grad_status = "✓" if grad_norm > 1e-6 else "✗ BLOCKED"
-                            print(f"    {grad_status} {name}: grad_norm={grad_norm:.2e}{gate_info}")
-                
-                print("=" * 80)
-            
+
             # Check for gradient explosion
             if grad_norm > 1e6:
                 logger.warning(f"Large gradient norm detected: {grad_norm:.2e} at epoch {epoch}, batch {batch_idx}")
@@ -2056,11 +1772,9 @@ def _validate_memristor(
     else:
         eval_t = t
     
-    # 重置能耗统计（如果启用）
     if hasattr(device_model, 'enable_energy') and device_model.enable_energy:
         device_model.reset_energy_stats()
-    
-    # 重置推理次数计数器（如果使用累加模式）
+
     if hasattr(device_model, 'drift_time_mode') and device_model.drift_time_mode == 'accumulate':
         device_model.reset_inference_count()
     
@@ -2105,7 +1819,6 @@ def _validate_memristor(
             losses.update(loss.item(), data.size(0))
             top1.update(acc1, data.size(0))
     
-    # 获取能耗统计（如果启用）
     energy_stats = None
     if hasattr(device_model, 'enable_energy') and device_model.enable_energy:
         energy_stats = device_model.get_energy_stats()

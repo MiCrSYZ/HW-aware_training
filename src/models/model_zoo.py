@@ -116,8 +116,8 @@ def _should_inject_noise_for_layer(
         return _get_enable_resnet(noise_config.get('layer2'))
     if 'layer3' in full_name:
         return _get_enable_resnet(noise_config.get('layer3'))
-    # 仅当配置为“纯 ResNet”时，未匹配到的层（如 bn/avgpool）才 return False；
-    # 若配置里同时有 ViT 键（patch_embed/attn/mlp），说明是 ViT，不要在这里 return False，交给下面 ViT 分支
+    # Pure ResNet config: unmatched layers (e.g. bn/avgpool) return False here.
+    # If ViT keys (patch_embed/attn/mlp) are also present, this is ViT — do not return False; handled below.
     if any(k in noise_config for k in ('stem', 'layer1', 'layer2', 'layer3', 'head')):
         if not any(k in noise_config for k in ('patch_embed', 'attn', 'mlp')):
             return False
@@ -260,29 +260,12 @@ def wrap_model_with_memristor(
             self.base_model = base_model  # same reference (already in-place replaced above)
         
         def forward(self, x, t=0, seed=None, enable_sanity_check=False, lengths=None):
-            # Forward with time parameter and enable_sanity_check
-            # Use a counter to only print from the first memristor layer
-            self._sanity_check_counter = [0]  # Use list to allow modification in nested calls
-            
-            # 如果启用累加模式的电导漂移，增加推理次数计数器
+            # Counter so nested forwards only run layer sanity on the first memristor layer when requested.
+            self._sanity_check_counter = [0]
+
             if hasattr(self.device_model, 'drift_time_mode') and self.device_model.drift_time_mode == 'accumulate':
                 self.device_model.increment_inference_count()
-            
-            # DEBUG: Check mapping_net in base_model before forward
-            if enable_sanity_check and self._sanity_check_counter[0] == 0:
-                print("\n" + "=" * 60)
-                print("DEBUG: MemristorModel.forward - checking mapping_net in base_model")
-                print("=" * 60)
-                print(f"self.base_model id: {id(self.base_model)}")
-                mapping_net_count = 0
-                for m in self.base_model.modules():
-                    if hasattr(m, 'mapping_net'):
-                        mapping_net_count += 1
-                        mn = getattr(m, 'mapping_net', None)
-                        print(f"  {type(m).__name__}: mapping_net = {type(mn).__name__ if mn is not None else 'None'} (id={id(mn) if mn is not None else None})")
-                print(f"Total layers with mapping_net: {mapping_net_count}")
-                print("=" * 60 + "\n")
-            
+
             return self._forward_with_t(self.base_model, x, t, seed, enable_sanity_check, self._sanity_check_counter, lengths=lengths)
         
         def _forward_with_t(self, module, x, t, seed, enable_sanity_check=False, sanity_check_counter=None, lengths=None):
@@ -336,75 +319,5 @@ def wrap_model_with_memristor(
     
     wrapped_model = MemristorModel(model, device_model)
 
-    # Debug: Print all modules with mapping_net attribute
-    # Check both wrapped_model.modules() and wrapped_model.base_model.modules()
-    # print("\n" + "=" * 60)
-    # print("DEBUG: Checking mapping_net in wrapped model")
-    # print("=" * 60)
-    # print("Checking wrapped_model.modules():")
-    # num_with_mapping_net = 0
-    # for m in wrapped_model.modules():
-    #     if hasattr(m, 'mapping_net'):
-    #         num_with_mapping_net += 1
-    #         mapping_net_value = m.mapping_net
-    #         mapping_net_str = f"{type(mapping_net_value).__name__}" if mapping_net_value is not None else "None"
-    #         print(f"  {type(m).__name__}: mapping_net = {mapping_net_str}")
-    #         if mapping_net_value is not None and hasattr(mapping_net_value, 'alpha'):
-    #             print(f"    -> alpha = {mapping_net_value.alpha}")
-    # print(f"Total in wrapped_model.modules(): {num_with_mapping_net}")
-    # 
-    # print("\nChecking wrapped_model.base_model.modules():")
-    # num_in_base = 0
-    # memristor_layers_found = []
-    # for m in wrapped_model.base_model.modules():
-    #     if hasattr(m, 'mapping_net'):
-    #         num_in_base += 1
-    #         mapping_net_value = m.mapping_net
-    #         mapping_net_str = f"{type(mapping_net_value).__name__}" if mapping_net_value is not None else "None"
-    #         print(f"  {type(m).__name__}: mapping_net = {mapping_net_str}")
-    #         if mapping_net_value is not None and hasattr(mapping_net_value, 'alpha'):
-    #             print(f"    -> alpha = {mapping_net_value.alpha}")
-    #     # Also check if it's a Memristor layer
-    #     if 'Memristor' in type(m).__name__:
-    #         memristor_layers_found.append(type(m).__name__)
-    # print(f"Total in base_model.modules() with mapping_net: {num_in_base}")
-    # print(f"Total Memristor layers found in base_model: {len(memristor_layers_found)}")
-    # if len(memristor_layers_found) > 0:
-    #     print(f"  Types: {set(memristor_layers_found)}")
-    # 
-    # # CRITICAL TEST: Try to set mapping_net directly and verify
-    # print("\nTEST: Trying to set mapping_net directly on base_model layers...")
-    # test_mapping_net = type('TestMappingNet', (), {'alpha': 999.0})()  # Dummy object for testing
-    # test_set_count = 0
-    # for m in wrapped_model.base_model.modules():
-    #     if hasattr(m, 'set_learned_mapping'):
-    #         test_set_count += 1
-    #         m.set_learned_mapping(test_mapping_net)
-    #         # Verify
-    #         if getattr(m, 'mapping_net', None) is test_mapping_net:
-    #             print(f"  ✓ Successfully set test mapping_net on {type(m).__name__}")
-    #         else:
-    #             print(f"  ✗ FAILED to set test mapping_net on {type(m).__name__}!")
-    # print(f"Test: Found {test_set_count} layers with set_learned_mapping, tried to set test mapping_net")
-    # 
-    # # Verify test mapping_net is still there
-    # print("\nVerifying test mapping_net after setting...")
-    # test_verify_count = 0
-    # for m in wrapped_model.base_model.modules():
-    #     if hasattr(m, 'mapping_net'):
-    #         test_verify_count += 1
-    #         mapping_net_value = getattr(m, 'mapping_net', None)
-    #         is_test = mapping_net_value is test_mapping_net
-    #         status = "✓" if is_test else "✗"
-    #         print(f"  {status} {type(m).__name__}: mapping_net = {type(mapping_net_value).__name__ if mapping_net_value is not None else 'None'}")
-    # print(f"Verified: {test_verify_count} layers, {sum(1 for m in wrapped_model.base_model.modules() if hasattr(m, 'mapping_net') and getattr(m, 'mapping_net', None) is test_mapping_net)} correctly set")
-    # 
-    # # Reset test mapping_net back to None
-    # for m in wrapped_model.base_model.modules():
-    #     if hasattr(m, 'set_learned_mapping'):
-    #         m.set_learned_mapping(None)
-    # 
-    # print("=" * 60 + "\n")
-    
     return wrapped_model
 

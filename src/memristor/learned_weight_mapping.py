@@ -48,7 +48,7 @@ class WeightMappingNet(nn.Module):
 
         # init last linear to small values to avoid large initial correction
         # nn.init.zeros_(self.elem_mlp[-2].weight)
-        nn.init.normal_(self.elem_mlp[-2].weight, mean=0.0, std=0.02)  # 小随机值
+        nn.init.normal_(self.elem_mlp[-2].weight, mean=0.0, std=0.02)  # small random init
         nn.init.zeros_(self.elem_mlp[-2].bias)
 
     def forward(self, W_noisy: torch.Tensor, noise_scale: Optional[float] = None,
@@ -63,10 +63,6 @@ class WeightMappingNet(nn.Module):
         Returns:
             delta_W: same shape as W_noisy
         """
-        # inside WeightMappingNet.forward (for debug only)
-        # print(f"[MAPPING CALLED] layer forward called, W_noisy device={W_noisy.device}, mapping_net id={id(self)}",flush=True)
-        # optionally increment a global counter
-
         # Flatten to elements: [N, 1]
         orig_shape = W_noisy.shape
         flat = W_noisy.reshape(-1, 1)
@@ -116,7 +112,7 @@ def hardware_linear_forward_with_weight_mapping(
         mapping_net: WeightMappingNet instance (optional)
         t: Time/cycle index for drift
         seed: Random seed for reproducibility
-        enable_sanity_check: Whether to enable debug output
+        enable_sanity_check: If True, emit extra debug logs (logger.debug) for this forward
         max_frac: Max fraction for delta clamping
         per_tile_quant: Whether to use per-tile quantization
         
@@ -192,8 +188,6 @@ def hardware_linear_forward_with_weight_mapping(
     
     # Check for NaN/Inf
     if torch.isnan(W_pre).any() or torch.isinf(W_pre).any():
-        import logging
-        logger = logging.getLogger(__name__)
         logger.warning("W_pre contains NaN/Inf, falling back to W_fp")
         W_pre = W_fp
     
@@ -210,17 +204,21 @@ def hardware_linear_forward_with_weight_mapping(
         'Gn_noisy': debug_info[1] if len(debug_info) > 1 else None,
     })
 
-    # Final debug
     if enable_sanity_check:
-        print("\n=== mapping-forward sanity ===")
-        print(f"W_fp mean: {debug['W_fp_mean']:.6e}")
-        print(f"W_pre mean: {debug['W_pre_mean']:.6e}")
         if debug['delta_mean'] is not None:
-            scale_str = f", scale: {debug['scale']:.6e}" if debug.get('scale') is not None else ""
-            print(f"delta mean: {debug['delta_mean']:.6e}, delta_max_abs: {debug['delta_max_abs']:.6e}, noise_scale: {debug['noise_scale']:.6e}{scale_str}")
+            scale_str = f", scale={debug['scale']:.6e}" if debug.get('scale') is not None else ""
+            logger.debug(
+                "mapping-forward sanity: W_fp_mean=%.6e W_pre_mean=%.6e delta_mean=%.6e "
+                "delta_max_abs=%.6e noise_scale=%.6e%s",
+                debug['W_fp_mean'],
+                debug['W_pre_mean'],
+                debug['delta_mean'],
+                debug['delta_max_abs'],
+                debug['noise_scale'],
+                scale_str,
+            )
         else:
-            print("mapping_net is None (no correction applied).")
-        print("=" * 30 + "\n", flush=True)
+            logger.debug("mapping-forward sanity: mapping_net inactive (no delta)")
 
     return out, {'W_pre': W_pre, 'debug': debug}
 
@@ -308,7 +306,7 @@ class MemristorConv2d(nn.Module):
         x_flat = x_unfold.transpose(1, 2)
 
         # Apply hardware mapping with learned mapping
-        # For Conv2d: patch内只tile不quant，输出patch-level float32
+        # Conv2d: per-patch tiling without quant here; patch-level float32 output
         out_flat, info = hardware_linear_forward_with_weight_mapping(
             x_flat,
             W_flat,
@@ -489,38 +487,6 @@ def train_weight_mapping(
             data, target = data.to(device), target.to(device)
             opt.zero_grad()
 
-            # Before forward, verify mapping_net is still set
-            if batch_idx == 0 and enable_sanity_check:
-                print("\n" + "=" * 60)
-                print(f"DEBUG: Before forward (epoch {epoch + 1}, batch {batch_idx})")
-                print("=" * 60)
-                forward_target_model = _train_weight_mapping_target_model
-                if hasattr(model, 'base_model'):
-                    forward_target_model = model.base_model
-                    print(f"Model type: {type(model)}, has base_model: True")
-                    print(
-                        f"target_model id: {id(_train_weight_mapping_target_model)}, model.base_model id: {id(model.base_model)}")
-                    print(f"Are they the same? {_train_weight_mapping_target_model is model.base_model}")
-                    if _train_weight_mapping_target_model is not model.base_model:
-                        print("WARNING: target_model and model.base_model are NOT the same object")
-                        print(" This could cause mapping_net to not be applied during forward")
-                else:
-                    forward_target_model = model
-                    print(f"Model type: {type(model)}, has base_model: False")
-
-                mapping_net_count = 0
-                for m in forward_target_model.modules():
-                    if hasattr(m, 'mapping_net'):
-                        mapping_net_count += 1
-                        mn = getattr(m, 'mapping_net', None)
-                        is_correct = mn is mapping_net
-                        status = "✓" if is_correct else "✗"
-                        print(
-                            f"  {status} {type(m).__name__}: mapping_net = {type(mn).__name__ if mn is not None else 'None'} "
-                            f"(id={id(mn) if mn is not None else None}, expected={id(mapping_net)})")
-                print(f"Total layers with mapping_net: {mapping_net_count}")
-                print("=" * 60 + "\n")
-
             # Forward through frozen model (mapping_net applied inside layers)
             # Use random t for each batch if enabled
             if use_random_t:
@@ -604,10 +570,6 @@ def train_weight_mapping(
         scale_value = mapping_net.scale.item() if hasattr(mapping_net, 'scale') else None
         scale_str = f", learned scale: {scale_value:.6f}" if scale_value is not None else ""
         logger.info(f"Post-train mapping epoch {epoch + 1}/{num_epochs}: loss={avg_loss:.4f}, acc={acc:.2f}%{scale_str}")
-        
-        # Print scale value with epoch ID as requested
-        if hasattr(mapping_net, 'scale'):
-            print(f"Epoch {epoch + 1}/{num_epochs} - learned scale: {mapping_net.scale.item():.6f}, loss: {avg_loss:.4f}, acc: {acc:.2f}%", flush=True)
 
     # Unfreeze main model after training mapping_net
     # This allows the main model to be trained in the outer training loop
@@ -628,7 +590,7 @@ def sanity_check_mapping_scale(model, device, sample_loader, t=0):
     with torch.no_grad():
         for data, _ in sample_loader:
             data = data.to(device)
-            # call forward with enable_sanity_check (first memristor layer prints itself)
+            # optional: first memristor layer may log mapping sanity when supported
             try:
                 _ = model(data[:32], t=t)
             except Exception:

@@ -1,175 +1,149 @@
 # Memristor-Aware Neural Network Evaluation Framework
 
-A production-quality PyTorch experiment framework for evaluating neural networks with memristor device non-idealities. Supports ResNet-20 and ViT-Tiny models on CIFAR-10 and MNIST, with three experiment modes: baseline, memristor without compensation, and memristor with compensation (HAT or learned mapping).
+PyTorch framework for evaluating neural networks under memristor device
+non-idealities. The code supports baseline training, post-training memristor
+evaluation, and hardware-aware training with compensation.
 
 ## Features
 
-- **Modular Design**: Clean separation between device models, neural networks, and experiment orchestration
-- **Three Experiment Modes**:
-  - `baseline`: Standard float training and evaluation
-  - `memristor_no_comp`: Weights mapped to memristor device model at evaluation time
-  - `memristor_with_comp`: Hardware-aware training (HAT) compensation
-- **Reproducibility**: Deterministic seeds, checkpointing, and comprehensive logging
-- **Visualization**: TensorBoard integration and local PNG plots
-- **Energy Estimation**: Hook for NeuroSim/MNSIM integration (stub provided)
-- **CLI Interface**: Easy-to-use command-line tools for training and evaluation
+- Baseline, memristor no-compensation, and memristor compensation modes
+- Device-level non-idealities: conductance variability, read noise, drift,
+  stuck devices, ADC quantization, and IR drop
+- Weight-to-conductance mapping utilities, including differential-pair mapping
+- Model support for ResNet-20, ViT-Tiny, and GRU AG News
+- Checkpointing, TensorBoard logging, optional Weights & Biases logging
+- Energy-estimation hook for NeuroSim/MNSIM-style integration
 
-## Quick Start
-
-### Installation
+## Installation
 
 ```bash
-# Create virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+python -m venv .venv
 
-# Install dependencies
+# Linux/macOS
+source .venv/bin/activate
+
+# Windows PowerShell
+.venv\Scripts\Activate.ps1
+
 pip install -r requirements.txt
 ```
 
-### Run Baseline Experiment
+## Quick Start
+
+Run a clean baseline:
 
 ```bash
-# CIFAR-10 baseline
-python -m src train --config configs/baseline/resnet20_baseline.yaml
-
-# MNIST baseline
-python -m src train --config configs/baseline/resnet20_mnist_baseline.yaml
+python -m src.train --config configs/baseline/resnet20_baseline.yaml
 ```
 
-### Run Memristor Experiment (No Compensation)
+Evaluate with memristor non-idealities after clean training:
 
 ```bash
 python -m src.train --config configs/memristor/resnet20_memristor_no_comp.yaml
 ```
 
-### Run Memristor Experiment (With HAT Compensation)
+Train with memristor-aware compensation:
 
 ```bash
-# ResNet-20 with compensation
-python -m src train --config configs/memristor/resnet20_memristor_comp.yaml --compensation hat
-
-# ViT-Tiny with compensation
-python -m src train --config configs/memristor/vit_tiny_memristor_comp.yaml --compensation hat
+python -m src.train --config configs/memristor/resnet20_memristor_comp.yaml --compensation hat
 ```
 
-### Resume Training
+Resume from a checkpoint:
 
 ```bash
-python -m src train --config configs/baseline/resnet20_baseline.yaml --resume outputs/exp_name/seed_42/model_best.pth
+python -m src.train --config configs/baseline/resnet20_baseline.yaml --resume outputs/exp_name/seed_42/model_best.pth
 ```
 
-### Evaluate Checkpoint
+Evaluate a checkpoint:
 
 ```bash
 python -m src.eval --config configs/baseline/resnet20_baseline.yaml --checkpoint outputs/exp_name/seed_42/model_final.pth
 ```
 
-## Available Configurations
+## Configurations
 
-YAML presets live under `configs/` in subfolders by role:
+YAML presets live under `configs/`:
 
 | Folder | Purpose |
 |--------|---------|
-| `configs/baseline/` | Float training/eval (no memristor forward); includes `default.yaml` (full option reference) |
-| `configs/memristor/` | Real device-model runs: `*_memristor_no_comp.yaml`, `*_memristor_comp.yaml` (HAT) |
+| `configs/baseline/` | Clean floating-point baselines |
+| `configs/memristor/` | Memristor device-model experiments |
 
-**Examples (paths):**
-- `configs/baseline/resnet20_baseline.yaml`, `configs/baseline/resnet20_mnist_baseline.yaml`, `configs/baseline/vit_tiny_baseline.yaml`
-- `configs/memristor/resnet20_memristor_no_comp.yaml`, `configs/memristor/resnet20_memristor_comp.yaml`
+Common examples:
+
+- `configs/baseline/resnet20_baseline.yaml`
+- `configs/baseline/vit_tiny_baseline.yaml`
+- `configs/memristor/resnet20_memristor_no_comp.yaml`
+- `configs/memristor/resnet20_memristor_comp.yaml`
 - `configs/memristor/vit_tiny_memristor_comp.yaml`
 
-## Configuration
+Important config sections:
 
-Configuration files are YAML-based and located under `configs/<subfolder>/`. Key sections:
+- `experiment.mode`: `baseline`, `memristor_no_comp`, or `memristor_with_comp`
+- `memristor`: device ranges, variability, read noise, drift, ADC, IR drop,
+  mapping, and layer noise-injection controls
+- `optimizer` and `scheduler`: training hyperparameters
+- `logging`: TensorBoard and optional W&B settings
 
-- **General**: `seed`, `device`, `dataset`, `data_root`, `model_name`, `batch_size`, `epochs` (default: 100)
-- **Optimizer**: `optimizer.type`, `optimizer.lr`, `optimizer.weight_decay`
-- **Scheduler**: `scheduler.type`, `scheduler.params`
-- **Memristor**: `memristor.G_min`, `memristor.G_max`, `memristor.variability_sigma`, `memristor.read_noise_sigma`, `memristor.drift_alpha`, `memristor.stuck_ratio`, `memristor.mapping`
-- **Experiment**: `experiment.mode`, `experiment.compensation_method`, `experiment.energy_estimation`
-- **Logging**: `logging.use_wandb`, `logging.project_name`, `logging.run_name`
+## Project Layout
 
-See `configs/baseline/default.yaml` for a complete example with all available options.
-
-## Project Structure
-
-```
+```text
 .
-├── README.md
-├── requirements.txt
-├── configs/              # YAML presets: baseline/, memristor/
-├── src/
-│   ├── __main__.py      # CLI entrypoint
-│   ├── train.py         # Training script
-│   ├── eval.py          # Evaluation script
-│   ├── utils/           # Utilities (logging, checkpointing, seeds, metrics)
-│   ├── data/            # Data loading and preprocessing
-│   ├── models/          # Model definitions (ResNet-20, ViT-Tiny, wrappers)
-│   ├── memristor/       # Device model, mapping, compensation, energy estimation
-│   └── experiments/     # Experiment orchestration and visualization
-├── tests/               # Unit tests
-├── examples/            # Example scripts
-└── docker/              # Dockerfile for reproducibility
+|-- README.md
+|-- requirements.txt
+|-- configs/
+|   |-- baseline/
+|   `-- memristor/
+|-- docker/
+|-- examples/
+|-- src/
+|   |-- data/
+|   |-- experiments/
+|   |-- memristor/
+|   |-- models/
+|   |-- utils/
+|   |-- train.py
+|   `-- eval.py
+`-- tests/
 ```
 
-## Adding a New Model
+## Adding a Model
 
-1. Create model definition in `src/models/` (e.g., `my_model.py`)
-2. Register in `src/models/model_zoo.py`:
-   ```python
-   def get_model(name: str, **kwargs):
-       if name == "my_model":
-           return MyModel(**kwargs)
-       ...
-   ```
-3. Create a config file under the appropriate `configs/baseline/`, `configs/memristor/`, etc., referencing the model name
-4. Run: `python -m src.train --config configs/baseline/my_model.yaml` (or place under the appropriate `configs/` subfolder)
+1. Add the model implementation under `src/models/`.
+2. Register it in `src/models/model_zoo.py`.
+3. Add a baseline config and, if needed, a memristor config.
+4. Run with `python -m src.train --config <config-path>`.
 
-## Integrating Real Energy Estimator
+## Energy Estimation Hook
 
-The energy estimation hook is located in `src/memristor/energy_estimator.py`. To integrate NeuroSim/MNSIM:
+The energy-estimation interface is in `src/memristor/energy_estimator.py`.
+Replace the stub implementation with calls to your simulator, using the model,
+device model, dataloader, subarray parameters, and technology-node settings from
+the config.
 
-1. Replace the `estimate_energy()` function in `EnergyEstimator.estimate()` method
-2. The function receives:
-   - `model`: PyTorch model
-   - `device_model`: MemristorDeviceModel instance
-   - `dataloader`: DataLoader for inference
-   - `subarray_size`, `num_subarrays`, `technology_node_nm`: Hardware parameters
-3. Return a dictionary with keys: `energy_joules`, `latency_seconds`, `power_watts`
+Expected return keys:
 
-Example:
-```python
-def estimate_energy(self, model, device_model, dataloader, **kwargs):
-    # Call your NeuroSim/MNSIM API here
-    energy = call_neurosim(model, device_model, dataloader, **kwargs)
-    return {
-        "energy_joules": energy,
-        "latency_seconds": latency,
-        "power_watts": power
-    }
-```
+- `energy_joules`
+- `latency_seconds`
+- `power_watts`
 
-## Expected Outputs
+## Outputs
 
-After running an experiment, check `outputs/{experiment_name}/{seed}/`:
+Training artifacts are written under `outputs/{experiment_name}/seed_{seed}/`:
 
-- `model_best.pth`: Best model checkpoint (highest validation accuracy)
-- `model_final.pth`: Final model state (after all epochs)
-- `metrics.csv`: Per-epoch metrics (loss, accuracy, etc.)
-- `accuracy_curve.png`: Training/validation accuracy curves
-- `accuracy_vs_variability.png`: Parameter sweep results (if applicable)
-- `tensorboard_logs/`: TensorBoard event files
+- `model_best.pth`
+- `model_final.pth`
+- `metrics.csv`
+- `accuracy_curve.png`
+- `tensorboard_logs/`
 
 ## Testing
-
-Run unit tests:
 
 ```bash
 python -m pytest tests/
 ```
 
-Or run individual test files:
+Run selected tests:
 
 ```bash
 python -m pytest tests/test_device_model.py
@@ -179,26 +153,16 @@ python -m pytest tests/test_model_forward.py
 
 ## Docker
 
-Build and run with Docker:
-
 ```bash
 docker build -t memristor-nn -f docker/Dockerfile .
-docker run --gpus all -v $(pwd)/outputs:/app/outputs memristor-nn python -m src.train --config configs/baseline/resnet20_baseline.yaml
+docker run --gpus all -v $(pwd)/outputs:/app/outputs memristor-nn \
+  python -m src.train --config configs/baseline/resnet20_baseline.yaml
 ```
 
-## Runtime Notes
+## Notes
 
-- **GPU Recommended**: ResNet-20 training on CIFAR-10 benefits from GPU acceleration
-- **CPU Fallback**: Works on CPU but will be slower; reduce `batch_size` and `epochs` for quick tests
-- **Memory**: ~2-4GB GPU memory for ResNet-20 with batch_size=128
-- **Time**: Baseline training ~30-60 minutes on GPU, memristor experiments may take longer due to non-ideality computation
-
-## License
-
-This project is provided as-is for research purposes.
-
-## Citation
-
-If you use this framework in your research, please cite appropriately.
-
-
+- A GPU is recommended for CIFAR-scale training.
+- CPU runs are supported but can be slow; reduce `batch_size` and `epochs` for
+  quick checks.
+- Generated datasets, outputs, local notes, scripts, and paper material are
+  intentionally ignored by Git.
