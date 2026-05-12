@@ -5,7 +5,7 @@ This repository is organized by research branch.
 The currently public code is on the `memristor-extract` branch:
 
 - GitHub: [memristor-extract](https://github.com/MiCrSYZ/HW-aware_training/tree/memristor-extract)
-- Paper: https://huggingface.co/papers/2605.09416
+- Paper: http://arxiv.org/abs/2605.09416
 - Local checkout:
 
 ```bash
